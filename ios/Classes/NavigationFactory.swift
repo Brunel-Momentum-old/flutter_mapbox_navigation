@@ -173,7 +173,14 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
             self._navigationViewController = NavigationViewController(for: routeResponse, routeIndex: 0, routeOptions: options, navigationOptions: navOptions)
             self._navigationViewController!.modalPresentationStyle = .fullScreen
             self._navigationViewController!.delegate = self
-            self._navigationViewController!.navigationMapView!.localizeLabels()
+            // iOS 26 fix: NavigationViewController inits with a nil
+            // navigationMapView on iOS 26, so the previous chained
+            // force-unwrap `navigationMapView!.localizeLabels()` traps
+            // with `Swift runtime failure: force unwrapped a nil value`
+            // before the nav UI can even render. Optional chaining is a
+            // no-op when the property is nil and a regular call when
+            // it's non-nil, so iOS 17/18 behaviour is unchanged.
+            self._navigationViewController!.navigationMapView?.localizeLabels()
             self._navigationViewController!.showsReportFeedback = _showReportFeedbackButton
             self._navigationViewController!.showsEndOfRouteFeedback = _showEndOfRouteFeedback
         }
