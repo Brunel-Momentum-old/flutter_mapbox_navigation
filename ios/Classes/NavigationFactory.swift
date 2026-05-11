@@ -184,7 +184,31 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
             self._navigationViewController!.showsReportFeedback = _showReportFeedbackButton
             self._navigationViewController!.showsEndOfRouteFeedback = _showEndOfRouteFeedback
         }
-        let flutterViewController = UIApplication.shared.delegate?.window??.rootViewController as! FlutterViewController
+        // iOS 26 fix #2: the legacy `UIApplication.shared.delegate?.window`
+        // lookup is unreliable on UIScene-based apps (everything since
+        // iOS 13). When the host app's window is nil or its root VC
+        // isn't the immediate FlutterViewController, the `as!` force-
+        // cast traps. Walk the connected scenes to find the topmost
+        // FlutterViewController + fail soft if none is found.
+        let flutterViewController: FlutterViewController? = {
+            let scenes = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+            let window = scenes
+                .flatMap { $0.windows }
+                .first(where: { $0.isKeyWindow })
+                ?? scenes.flatMap { $0.windows }.first
+                ?? UIApplication.shared.delegate?.window ?? nil
+            var top = window?.rootViewController
+            while let presented = top?.presentedViewController { top = presented }
+            return top as? FlutterViewController
+        }()
+        guard let flutterViewController else {
+            sendEvent(
+                eventType: MapBoxEventType.route_build_failed,
+                data: "No FlutterViewController found to present navigation"
+            )
+            return
+        }
         flutterViewController.present(self._navigationViewController!, animated: true, completion: nil)
     }
     
