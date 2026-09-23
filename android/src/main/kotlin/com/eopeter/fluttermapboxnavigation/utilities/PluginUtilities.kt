@@ -9,6 +9,7 @@ import com.eopeter.fluttermapboxnavigation.FlutterMapboxNavigationPlugin
 import com.eopeter.fluttermapboxnavigation.models.MapBoxEvents
 import com.eopeter.fluttermapboxnavigation.models.MapBoxRouteProgressEvent
 import io.flutter.plugin.common.MethodCall
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.Serializable
@@ -43,14 +44,15 @@ class PluginUtilities {
         }
 
         fun sendEvent(event: MapBoxEvents, data: String = "") {
-            val jsonString =
-                if (MapBoxEvents.MILESTONE_EVENT == event || event == MapBoxEvents.USER_OFF_ROUTE || event == MapBoxEvents.ROUTE_BUILT || event == MapBoxEvents.ON_MAP_TAP) "{" +
-                        "  \"eventType\": \"${event.value}\"," +
-                        "  \"data\": $data" +
-                        "}" else "{" +
-                        "  \"eventType\": \"${event.value}\"," +
-                        "  \"data\": \"$data\"" +
-                        "}"
+            // Always emit valid JSON: raw-JSON events with no payload used to
+            // produce `"data": }` (USER_OFF_ROUTE sends none), and string
+            // payloads were not escaped (a quote in an instruction broke it).
+            val isRawJson = MapBoxEvents.MILESTONE_EVENT == event || event == MapBoxEvents.USER_OFF_ROUTE || event == MapBoxEvents.ROUTE_BUILT || event == MapBoxEvents.ON_MAP_TAP
+            val dataJson = if (isRawJson) data.ifBlank { "{}" } else JSONObject.quote(data)
+            val jsonString = "{" +
+                    "  \"eventType\": \"${event.value}\"," +
+                    "  \"data\": $dataJson" +
+                    "}"
             FlutterMapboxNavigationPlugin.eventSink?.success(jsonString)
         }
 

@@ -7,6 +7,36 @@ import MapboxNavigation
 
 public class NavigationFactory : NSObject, FlutterStreamHandler
 {
+    /// Resolve the Flutter root VC without force-casting.
+    ///
+    /// Under the UIScene lifecycle `AppDelegate.window` can be nil, and the
+    /// key window's root is not always the FlutterViewController (a system
+    /// alert, a permission prompt or another window can be key). Try the
+    /// legacy lookup, then every window of every connected scene, key window
+    /// first. Returns nil instead of crashing when nothing matches.
+    func flutterRootViewController() -> FlutterViewController? {
+        if let legacy = UIApplication.shared.delegate?.window??.rootViewController as? FlutterViewController {
+            return legacy
+        }
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .sorted { $0.isKeyWindow && !$1.isKeyWindow }
+        for window in windows {
+            if let flutter = window.rootViewController as? FlutterViewController {
+                return flutter
+            }
+            var top = window.rootViewController
+            while let presented = top?.presentedViewController {
+                if let flutter = presented as? FlutterViewController {
+                    return flutter
+                }
+                top = presented
+            }
+        }
+        return nil
+    }
+
     var _navigationViewController: NavigationViewController? = nil
     var _eventSink: FlutterEventSink? = nil
     
@@ -67,7 +97,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     func startFreeDrive(arguments: NSDictionary?, result: @escaping FlutterResult)
     {
         let freeDriveViewController = FreeDriveViewController()
-        let flutterViewController = UIApplication.shared.delegate?.window??.rootViewController as! FlutterViewController
+        guard let flutterViewController = flutterRootViewController() else {
+            result(FlutterError(code: "NO_FLUTTER_VC", message: "Could not find FlutterViewController to present navigation", details: nil))
+            return
+        }
         flutterViewController.present(freeDriveViewController, animated: true, completion: nil)
     }
     
@@ -121,8 +154,8 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
             guard let strongSelf = self else { return }
             switch result {
             case .failure(let error):
-                strongSelf.sendEvent(eventType: MapBoxEventType.route_build_failed)
-                flutterResult("An error occured while calculating the route \(error.localizedDescription)")
+                strongSelf.sendEvent(eventType: MapBoxEventType.route_build_failed, data: error.localizedDescription)
+                flutterResult(FlutterError(code: "ROUTE_BUILD_FAILED", message: error.localizedDescription, details: nil))
             case .success(let response):
                 guard let routes = response.routes else { return }
                 //TODO: if more than one route found, give user option to select one: DOES NOT WORK
@@ -132,7 +165,11 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
                     strongSelf._routes = routes
                     let routeOptionsView = RouteOptionsViewController(routes: routes, options: strongSelf._options!)
                     
-                    let flutterViewController = UIApplication.shared.delegate?.window??.rootViewController as! FlutterViewController
+                    guard let flutterViewController = strongSelf.flutterRootViewController() else {
+                        strongSelf.sendEvent(eventType: MapBoxEventType.route_build_failed, data: "Could not find FlutterViewController to present route options")
+                        flutterResult(FlutterError(code: "NO_FLUTTER_VC", message: "Could not find FlutterViewController", details: nil))
+                        return
+                    }
                     flutterViewController.present(routeOptionsView, animated: true, completion: nil)
                 }
                 else
@@ -168,16 +205,38 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     func startNavigation(routeResponse: RouteResponse, options: NavigationRouteOptions, navOptions: NavigationOptions)
     {
         isEmbeddedNavigation = false
-        if(self._navigationViewController == nil)
+        // A second start while a session is still presented used to re-present
+        // the same view controller (UIKit throws) with the OLD route. End the
+        // previous session and dismiss it first, then present the new one.
+        if let previous = self._navigationViewController
         {
-            self._navigationViewController = NavigationViewController(for: routeResponse, routeIndex: 0, routeOptions: options, navigationOptions: navOptions)
-            self._navigationViewController!.modalPresentationStyle = .fullScreen
-            self._navigationViewController!.delegate = self
-            self._navigationViewController!.navigationMapView!.localizeLabels()
-            self._navigationViewController!.showsReportFeedback = _showReportFeedbackButton
-            self._navigationViewController!.showsEndOfRouteFeedback = _showEndOfRouteFeedback
+            previous.navigationService.endNavigation(feedback: nil)
+            self._navigationViewController = nil
+            if(previous.presentingViewController != nil)
+            {
+                previous.dismiss(animated: false, completion: { [weak self] in
+                    self?.presentNavigation(routeResponse: routeResponse, options: options, navOptions: navOptions)
+                })
+                return
+            }
         }
-        let flutterViewController = UIApplication.shared.delegate?.window??.rootViewController as! FlutterViewController
+        presentNavigation(routeResponse: routeResponse, options: options, navOptions: navOptions)
+    }
+
+    private func presentNavigation(routeResponse: RouteResponse, options: NavigationRouteOptions, navOptions: NavigationOptions)
+    {
+        self._navigationViewController = NavigationViewController(for: routeResponse, routeIndex: 0, routeOptions: options, navigationOptions: navOptions)
+        self._navigationViewController!.modalPresentationStyle = .fullScreen
+        self._navigationViewController!.delegate = self
+        self._navigationViewController?.navigationMapView?.localizeLabels()
+        self._navigationViewController!.showsReportFeedback = _showReportFeedbackButton
+        self._navigationViewController!.showsEndOfRouteFeedback = _showEndOfRouteFeedback
+        guard let flutterViewController = flutterRootViewController() else {
+            self._navigationViewController = nil
+            sendEvent(eventType: MapBoxEventType.route_build_failed, data: "Could not find FlutterViewController to present navigation")
+            return
+        }
+        sendEvent(eventType: MapBoxEventType.route_built)
         flutterViewController.present(self._navigationViewController!, animated: true, completion: nil)
     }
     
@@ -255,30 +314,44 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         
     }
     
+    /// Ends the session and replies to `result` exactly once, in every branch.
+    ///
+    /// The embedded branch and the "nothing to end" branch used to return
+    /// without replying, so a Dart `await finishNavigation()` sat until its
+    /// own timeout (the driver-visible "back from navigation hangs").
     func endNavigation(result: FlutterResult?)
     {
         sendEvent(eventType: MapBoxEventType.navigation_finished)
-        if(self._navigationViewController != nil)
-        {
-            self._navigationViewController?.navigationService.endNavigation(feedback: nil)
-            if(isEmbeddedNavigation)
-            {
-                self._navigationViewController?.view.removeFromSuperview()
-                self._navigationViewController?.removeFromParent()
-                self._navigationViewController = nil
-            }
-            else
-            {
-                self._navigationViewController?.dismiss(animated: true, completion: {
-                    self._navigationViewController = nil
-                    if(result != nil)
-                    {
-                        result!(true)
-                    }
-                })
-            }
+        guard let navigationViewController = self._navigationViewController else {
+            result?(true)
+            return
         }
-        
+        navigationViewController.navigationService.endNavigation(feedback: nil)
+        if(isEmbeddedNavigation)
+        {
+            navigationViewController.willMove(toParent: nil)
+            navigationViewController.view.removeFromSuperview()
+            navigationViewController.removeFromParent()
+            self._navigationViewController = nil
+            result?(true)
+        }
+        else if(navigationViewController.presentingViewController != nil)
+        {
+            navigationViewController.dismiss(animated: true, completion: { [weak self] in
+                if(self?._navigationViewController === navigationViewController)
+                {
+                    self?._navigationViewController = nil
+                }
+                result?(true)
+            })
+        }
+        else
+        {
+            // Not presented (already dismissed): dismiss(completion:) may never
+            // fire its completion, so reply now.
+            self._navigationViewController = nil
+            result?(true)
+        }
     }
     
     func getLocationsFromFlutterArgument(arguments: NSDictionary?) -> [Location]? {
@@ -316,11 +389,9 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         let routeEvent = MapBoxRouteEvent(eventType: eventType, data: data)
         
         let jsonEncoder = JSONEncoder()
-        let jsonData = try! jsonEncoder.encode(routeEvent)
-        let eventJson = String(data: jsonData, encoding: String.Encoding.utf8)
-        if(_eventSink != nil){
-            _eventSink!(eventJson)
-        }
+        guard let jsonData = try? jsonEncoder.encode(routeEvent),
+              let eventJson = String(data: jsonData, encoding: String.Encoding.utf8) else { return }
+        _eventSink?(eventJson)
         
     }
     
@@ -369,7 +440,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         
         if routes != nil && !routes!.isEmpty {
             let jsonEncoder = JSONEncoder()
-            let jsonData = try! jsonEncoder.encode(response.routes!)
+            guard let jsonData = try? jsonEncoder.encode(response.routes!) else { return "{}" }
             return String(data: jsonData, encoding: String.Encoding.utf8) ?? "{}"
         }
         
@@ -402,11 +473,13 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             let jsonEncoder = JSONEncoder()
             
             let progressEvent = MapBoxRouteProgressEvent(progress: progress)
-            let progressEventJsonData = try! jsonEncoder.encode(progressEvent)
-            let progressEventJson = String(data: progressEventJsonData, encoding: String.Encoding.ascii)
-            
-            _eventSink!(progressEventJson)
-            
+            // A progress sample that fails to encode is skipped, never fatal.
+            if let progressEventJsonData = try? jsonEncoder.encode(progressEvent),
+               let progressEventJson = String(data: progressEventJsonData, encoding: String.Encoding.utf8)
+            {
+                _eventSink?(progressEventJson)
+            }
+
             if(progress.isFinalLeg && progress.currentLegProgress.userHasArrivedAtWaypoint && !_showEndOfRouteFeedback)
             {
                 _eventSink = nil
@@ -446,8 +519,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             let jsonEncoder = JSONEncoder()
             
             let localFeedback = Feedback(rating: feedback.rating, comment: feedback.comment)
-            let feedbackJsonData = try! jsonEncoder.encode(localFeedback)
-            let feedbackJson = String(data: feedbackJsonData, encoding: String.Encoding.ascii)
+            let feedbackJson = (try? jsonEncoder.encode(localFeedback)).flatMap { String(data: $0, encoding: String.Encoding.utf8) }
             
             sendEvent(eventType: MapBoxEventType.navigation_finished, data: feedbackJson ?? "")
             

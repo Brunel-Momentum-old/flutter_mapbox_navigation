@@ -26,7 +26,10 @@ class MapBoxNavigationViewController {
 
   ValueSetter<RouteEvent>? _routeEventNotifier;
 
-  late StreamSubscription<RouteEvent> _routeEventSubscription;
+  /// Null until [initialize] or [buildRoute] subscribes. Nullable (not
+  /// `late`) so [dispose] is safe when the view closes before a route was
+  /// ever built.
+  StreamSubscription<dynamic>? _routeEventSubscription;
 
   ///Current Device OS Version
   Future<String> get platformVersion => _methodChannel
@@ -89,7 +92,7 @@ class MapBoxNavigationViewController {
     if (options != null) args = options.toMap();
     args['wayPoints'] = wayPointMap;
 
-    _routeEventSubscription = _streamRouteEvent!.listen(_onProgressData);
+    _listenForRouteEvents();
     return _methodChannel
         .invokeMethod('buildRoute', args)
         .then((dynamic result) => result as bool);
@@ -97,7 +100,22 @@ class MapBoxNavigationViewController {
 
   /// starts listening for events
   Future<void> initialize() async {
-    _routeEventSubscription = _streamRouteEvent!.listen(_onProgressData);
+    _listenForRouteEvents();
+  }
+
+  /// (Re)subscribe to the native event stream. Any previous subscription is
+  /// cancelled first so repeated calls never stack listeners; the native
+  /// side re-attaches its sink on the new listen (iOS drops it on arrival).
+  void _listenForRouteEvents() {
+    _routeEventSubscription?.cancel();
+    _routeEventSubscription = _eventChannel.receiveBroadcastStream().listen(
+      _onRawEvent,
+      // A platform-side stream error must not surface as an uncaught error
+      // or end the subscription.
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('MapBoxNavigationViewController: event error: $error');
+      },
+    );
   }
 
   /// Clear the built route and resets the map
@@ -116,7 +134,6 @@ class MapBoxNavigationViewController {
   Future<bool?> startNavigation({MapBoxOptions? options}) async {
     Map<String, dynamic>? args;
     if (options != null) args = options.toMap();
-    //_routeEventSubscription = _streamRouteEvent.listen(_onProgressData);
     return _methodChannel.invokeMethod('startNavigation', args);
   }
 
@@ -138,24 +155,28 @@ class MapBoxNavigationViewController {
   /// Call this to cancel the subscription to route events
   /// Add here future disposing methods
   void dispose() {
-    _routeEventSubscription.cancel();
+    _routeEventSubscription?.cancel();
+    _routeEventSubscription = null;
   }
 
-  void _onProgressData(RouteEvent event) {
-    if (_routeEventNotifier != null) _routeEventNotifier?.call(event);
-  }
-
-  Stream<RouteEvent>? get _streamRouteEvent {
-    return _eventChannel
-        .receiveBroadcastStream()
-        .map((dynamic event) => _parseRouteEvent(event as String));
+  void _onRawEvent(dynamic raw) {
+    final RouteEvent event;
+    try {
+      if (raw is! String) return;
+      event = _parseRouteEvent(raw);
+    } catch (e) {
+      // Skip a malformed event instead of breaking the stream.
+      debugPrint('MapBoxNavigationViewController: dropped malformed event: $e');
+      return;
+    }
+    _routeEventNotifier?.call(event);
   }
 
   RouteEvent _parseRouteEvent(String jsonString) {
     RouteEvent event;
     final map = json.decode(jsonString) as Map<String, dynamic>;
     final progressEvent = RouteProgressEvent.fromJson(map);
-    if (progressEvent.isProgressEvent!) {
+    if (progressEvent.isProgressEvent ?? false) {
       event = RouteEvent(
         eventType: MapBoxEvent.progress_change,
         data: progressEvent,
