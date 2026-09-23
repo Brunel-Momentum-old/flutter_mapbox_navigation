@@ -24,7 +24,8 @@ class RouteEvent {
     if (eventType == MapBoxEvent.progress_change) {
       data = RouteProgressEvent.fromJson(dataJson as Map<String, dynamic>);
     } else if (eventType == MapBoxEvent.navigation_finished &&
-        (dataJson as String).isNotEmpty) {
+        dataJson is String &&
+        dataJson.isNotEmpty) {
       data =
           MapBoxFeedback.fromJson(jsonDecode(dataJson) as Map<String, dynamic>);
     } else if (eventType == MapBoxEvent.on_map_tap) {

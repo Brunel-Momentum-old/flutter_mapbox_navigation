@@ -82,6 +82,7 @@ open class TurnByTurn(
             "startFreeDrive" -> {
                 FlutterMapboxNavigationPlugin.enableFreeDriveMode = true
                 this.startFreeDrive()
+                result.success(true)
             }
             "startNavigation" -> {
                 FlutterMapboxNavigationPlugin.enableFreeDriveMode = false
@@ -106,12 +107,19 @@ open class TurnByTurn(
         val arguments = methodCall.arguments as? Map<*, *>
         if (arguments != null) this.setOptions(arguments)
         this.addedWaypoints.clear()
-        val points = arguments?.get("wayPoints") as HashMap<*, *>
+        val points = arguments?.get("wayPoints") as? Map<*, *>
+        if (points == null || MapboxNavigationApp.current() == null) {
+            // Not ready (Drop-In not initialised yet) or no waypoints: reply
+            // false instead of crashing on a null navigation instance.
+            PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
+            result.success(false)
+            return
+        }
         for (item in points) {
-            val point = item.value as HashMap<*, *>
-            val latitude = point["Latitude"] as Double
-            val longitude = point["Longitude"] as Double
-            val isSilent = point["IsSilent"] as Boolean
+            val point = item.value as? Map<*, *> ?: continue
+            val latitude = point["Latitude"] as? Double ?: continue
+            val longitude = point["Longitude"] as? Double ?: continue
+            val isSilent = point["IsSilent"] as? Boolean ?: false
             this.addedWaypoints.add(Waypoint(Point.fromLngLat(longitude, latitude),isSilent))
         }
         this.getRoute(this.context)
@@ -119,7 +127,12 @@ open class TurnByTurn(
     }
 
     private fun getRoute(context: Context) {
-        MapboxNavigationApp.current()!!.requestRoutes(
+        val navigation = MapboxNavigationApp.current()
+        if (navigation == null) {
+            PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
+            return
+        }
+        navigation.requestRoutes(
             routeOptions = RouteOptions
                 .builder()
                 .applyDefaultNavigationOptions(navigationMode)
@@ -176,6 +189,7 @@ open class TurnByTurn(
         val navigation = MapboxNavigationApp.current()
         navigation?.stopTripSession()
         PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+        result.success(true)
     }
 
     private fun startFreeDrive() {
@@ -218,7 +232,8 @@ open class TurnByTurn(
     }
 
     private fun finishNavigation(isOffRouted: Boolean = false) {
-        MapboxNavigationApp.current()!!.stopTripSession()
+        // Null-safe: finishing before Drop-In initialised used to NPE.
+        MapboxNavigationApp.current()?.stopTripSession()
         this.isNavigationCanceled = true
         PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
     }

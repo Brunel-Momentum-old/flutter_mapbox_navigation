@@ -82,7 +82,8 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
             }
             else if(call.method == "reCenter"){
                 //used to recenter map from user action during navigation
-                strongSelf.navigationMapView.navigationCamera.follow()
+                strongSelf.navigationMapView?.navigationCamera.follow()
+                result(true)
             }
             else
             {
@@ -158,14 +159,16 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
     {
         if routeResponse == nil
         {
+            result(true)
             return
         }
         if (navigationService != nil) {
             navigationService.stop()
         }
-        navigationMapView.removeRoutes()
+        navigationMapView?.removeRoutes()
         routeResponse = nil
         sendEvent(eventType: MapBoxEventType.navigation_cancelled)
+        result(true)
     }
 
     func buildRoute(arguments: NSDictionary?, flutterResult: @escaping FlutterResult)
@@ -174,16 +177,23 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         isEmbeddedNavigation = true
         sendEvent(eventType: MapBoxEventType.route_building)
 
-        guard let oWayPoints = arguments?["wayPoints"] as? NSDictionary else {return}
+        // Every early exit must still reply, or the Dart `await buildRoute()`
+        // never completes.
+        let failBuild = { [weak self] in
+            self?.sendEvent(eventType: MapBoxEventType.route_build_failed)
+            flutterResult(false)
+        }
+
+        guard let oWayPoints = arguments?["wayPoints"] as? NSDictionary else { failBuild(); return }
 
         var locations = [Location]()
 
         for item in oWayPoints as NSDictionary
         {
-            let point = item.value as! NSDictionary
-            guard let oName = point["Name"] as? String else {return}
-            guard let oLatitude = point["Latitude"] as? Double else {return}
-            guard let oLongitude = point["Longitude"] as? Double else {return}
+            guard let point = item.value as? NSDictionary else { failBuild(); return }
+            guard let oName = point["Name"] as? String else { failBuild(); return }
+            guard let oLatitude = point["Latitude"] as? Double else { failBuild(); return }
+            guard let oLongitude = point["Longitude"] as? Double else { failBuild(); return }
             let oIsSilent = point["IsSilent"] as? Bool ?? false
             let order = point["Order"] as? Int
             let location = Location(name: oName, latitude: oLatitude, longitude: oLongitude, order: order,isSilent: oIsSilent)
@@ -242,14 +252,16 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         // Generate the route object and draw it on the map
         _ = Directions.shared.calculate(routeOptions) { [weak self] (session, result) in
 
-            guard case let .success(response) = result, let strongSelf = self else {
+            guard case let .success(response) = result, let strongSelf = self,
+                  let routes = response.routes, !routes.isEmpty else {
                 flutterResult(false)
                 self?.sendEvent(eventType: MapBoxEventType.route_build_failed)
                 return
             }
             strongSelf.routeResponse = response
+            strongSelf.selectedRouteIndex = 0
             strongSelf.sendEvent(eventType: MapBoxEventType.route_built, data: strongSelf.encodeRouteResponse(response: response))
-            strongSelf.navigationMapView?.showcase(response.routes!, routesPresentationStyle: .all(shouldFit: true), animated: true)
+            strongSelf.navigationMapView?.showcase(routes, routesPresentationStyle: .all(shouldFit: true), animated: true)
             flutterResult(true)
         }
     }
@@ -270,12 +282,60 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         result(true)
     }
 
+    /// Host view controller for the embedded NavigationViewController.
+    ///
+    /// Prefer the view controller that actually owns this platform view (via
+    /// the responder chain), then the UIScene-aware root lookup. Never
+    /// force-casts: a key window whose root is not the FlutterViewController
+    /// (system alert, permission prompt) used to crash here.
+    func embeddedHostViewController() -> UIViewController? {
+        var responder: UIResponder? = navigationMapView
+        while let current = responder {
+            if let viewController = current as? UIViewController {
+                return viewController
+            }
+            responder = current.next
+        }
+        return flutterRootViewController()
+    }
+
+    /// Ends and detaches the current embedded session, if any, without
+    /// emitting events. Called before a new start so a second start never
+    /// stacks a second NavigationViewController / NavigationService on top of
+    /// a live one.
+    func tearDownEmbeddedNavigation() {
+        guard let previous = _navigationViewController else { return }
+        previous.navigationService.endNavigation(feedback: nil)
+        previous.willMove(toParent: nil)
+        previous.view.removeFromSuperview()
+        previous.removeFromParent()
+        _navigationViewController = nil
+    }
+
     func startEmbeddedNavigation(arguments: NSDictionary?, result: @escaping FlutterResult) {
-        guard let response = self.routeResponse else { return }
-        let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: response.routes!.first!) : NavigationLocationManager()
+        guard let response = self.routeResponse,
+              let routes = response.routes, !routes.isEmpty,
+              let routeOptions = self.routeOptions else {
+            result(false)
+            return
+        }
+        guard navigationMapView != nil, let hostViewController = embeddedHostViewController() else {
+            sendEvent(eventType: MapBoxEventType.route_build_failed, data: "Could not find a view controller to host navigation")
+            result(FlutterError(code: "NO_FLUTTER_VC", message: "Could not find a view controller to host navigation", details: nil))
+            return
+        }
+        if selectedRouteIndex >= routes.count {
+            selectedRouteIndex = 0
+        }
+
+        // Double start: end the live session before building a new service.
+        tearDownEmbeddedNavigation()
+        isEmbeddedNavigation = true
+
+        let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: routes[selectedRouteIndex]) : NavigationLocationManager()
         navigationService = MapboxNavigationService(routeResponse: response,
                                                             routeIndex: selectedRouteIndex,
-                                                            routeOptions: routeOptions!,
+                                                            routeOptions: routeOptions,
                                                             routingProvider: MapboxRoutingProvider(.hybrid),
                                                             credentials: NavigationSettings.shared.directions.credentials,
                                                             locationSource: navLocationManager,
@@ -292,25 +352,19 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         }
         let navigationOptions = NavigationOptions(styles: [dayStyle, nightStyle], navigationService: navigationService)
 
-        // Remove previous navigation view and controller if any
-        if(_navigationViewController?.view != nil){
-            _navigationViewController!.view.removeFromSuperview()
-            _navigationViewController?.removeFromParent()
-        }
+        let navigationViewController = NavigationViewController(for: response, routeIndex: selectedRouteIndex, routeOptions: routeOptions, navigationOptions: navigationOptions)
+        navigationViewController.delegate = self
 
-        _navigationViewController = NavigationViewController(for: response, routeIndex: selectedRouteIndex, routeOptions: routeOptions!, navigationOptions: navigationOptions)
-        _navigationViewController!.delegate = self
+        navigationViewController.showsReportFeedback = _showReportFeedbackButton
+        navigationViewController.showsEndOfRouteFeedback = _showEndOfRouteFeedback
 
-        _navigationViewController!.showsReportFeedback = _showReportFeedbackButton
-        _navigationViewController!.showsEndOfRouteFeedback = _showEndOfRouteFeedback
+        _navigationViewController = navigationViewController
+        hostViewController.addChild(navigationViewController)
 
-        let flutterViewController = UIApplication.shared.delegate?.window?!.rootViewController as! FlutterViewController
-        flutterViewController.addChild(_navigationViewController!)
-
-        self.navigationMapView.addSubview(_navigationViewController!.view)
-        _navigationViewController!.view.translatesAutoresizingMaskIntoConstraints = false
-        constraintsWithPaddingBetween(holderView: self.navigationMapView, topView: _navigationViewController!.view, padding: 0.0)
-        flutterViewController.didMove(toParent: flutterViewController)
+        self.navigationMapView.addSubview(navigationViewController.view)
+        navigationViewController.view.translatesAutoresizingMaskIntoConstraints = false
+        constraintsWithPaddingBetween(holderView: self.navigationMapView, topView: navigationViewController.view, padding: 0.0)
+        navigationViewController.didMove(toParent: hostViewController)
         result(true)
 
     }
@@ -382,10 +436,13 @@ extension FlutterMapboxNavigationView : NavigationServiceDelegate {
             let jsonEncoder = JSONEncoder()
 
             let progressEvent = MapBoxRouteProgressEvent(progress: progress)
-            let progressEventJsonData = try! jsonEncoder.encode(progressEvent)
-            let progressEventJson = String(data: progressEventJsonData, encoding: String.Encoding.ascii)
-
-            _eventSink!(progressEventJson)
+            // A progress sample that fails to encode is skipped, never fatal.
+            // utf8, not ascii: ascii returns nil for any accented street name.
+            if let progressEventJsonData = try? jsonEncoder.encode(progressEvent),
+               let progressEventJson = String(data: progressEventJsonData, encoding: String.Encoding.utf8)
+            {
+                _eventSink?(progressEventJson)
+            }
 
             if(progress.isFinalLeg && progress.currentLegProgress.userHasArrivedAtWaypoint)
             {
