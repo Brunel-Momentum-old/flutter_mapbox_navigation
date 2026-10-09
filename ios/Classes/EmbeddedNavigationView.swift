@@ -377,7 +377,7 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         tearDownEmbeddedNavigation()
         isEmbeddedNavigation = true
 
-        let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: routes[selectedRouteIndex]) : NavigationLocationManager()
+        let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: routes[selectedRouteIndex]) : HostLocationManager()
         // Never `.onPoorGPS`: it drives the puck along the route by itself
         // whenever 2.5 s pass without a good fix. A driver standing still
         // indoors watched the map creep forward, then snap back and swing
