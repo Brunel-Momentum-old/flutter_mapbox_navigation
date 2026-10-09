@@ -378,13 +378,17 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         isEmbeddedNavigation = true
 
         let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: routes[selectedRouteIndex]) : NavigationLocationManager()
+        // Never `.onPoorGPS`: it drives the puck along the route by itself
+        // whenever 2.5 s pass without a good fix. A driver standing still
+        // indoors watched the map creep forward, then snap back and swing
+        // round each time a real fix arrived. Only a tunnel may be bridged.
         navigationService = MapboxNavigationService(routeResponse: response,
                                                             routeIndex: selectedRouteIndex,
                                                             routeOptions: routeOptions,
                                                             routingProvider: MapboxRoutingProvider(.hybrid),
                                                             credentials: NavigationSettings.shared.directions.credentials,
                                                             locationSource: navLocationManager,
-                                                    simulating: self._simulateRoute ? .always : .onPoorGPS)
+                                                    simulating: self._simulateRoute ? .always : .inTunnels)
         navigationService.delegate = self
 
         var dayStyle = CustomDayStyle()
