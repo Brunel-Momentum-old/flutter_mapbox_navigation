@@ -1,6 +1,7 @@
 import CoreLocation
 import MapboxMaps
 import MapboxNavigation
+import UIKit
 
 /// How often the maps draw.
 ///
@@ -43,7 +44,7 @@ extension NavigationFactory {
     /// Sets the navigation map's rate for the tick just handled. Called
     /// last in the tick, after the SDK has set its own.
     func paceMap(_ map: NavigationMapView, at location: CLLocation, phone: CLLocation) {
-        dropLocationLayer(of: map)
+        quietMapLocation(of: map)
         // The phone's own speed as well: the navigator can take a tick
         // or two to move off after the phone has.
         let moved = _lastTickLocation.map { location.distance(from: $0) > MapPower.still } ?? true
@@ -67,17 +68,31 @@ extension NavigationFactory {
         }
     }
 
-    /// The SDK keeps an invisible location layer on the navigation map
-    /// and rewrites it after every frame it draws. That rewrite is what
-    /// makes the next frame, so the map never rests, and it costs a
-    /// tenth of a processor core to re-encode a layer nobody sees. The
-    /// driver's marker is a view of the SDK's own, moved by guidance; it
-    /// does not use the layer. Checked every tick because the SDK puts
-    /// the layer back whenever it sets the marker up again.
-    func dropLocationLayer(of map: NavigationMapView) {
-        guard case .courseView? = map.userLocationStyle,
-              map.mapView.location.options.puckType != nil else { return }
-        map.mapView.location.options.puckType = nil
+    /// Cuts the navigation map off from the map SDK's own location feed.
+    /// Guidance already tells it where the driver is, snapped to the
+    /// road; the second feed only made work. Checked every tick because
+    /// the SDK puts both parts back whenever it sets the marker up again.
+    ///
+    /// The invisible location layer: the SDK rewrites it after every
+    /// frame the map draws, and that rewrite is what makes the next
+    /// frame, so the map never rests, and it costs a tenth of a processor
+    /// core to re-encode a layer nobody sees. The driver's marker is a
+    /// view of the SDK's own, moved by guidance; it does not use the
+    /// layer.
+    ///
+    /// The listeners: the SDK has the route line follow the phone's raw
+    /// position as well as the snapped one. The two are a few metres
+    /// apart, so each location or compass reading moved the line's
+    /// cut-off to one and the next frame moved it back: two redraws a
+    /// reading, several readings a second, with the van standing still.
+    /// With nothing listening, the map's own location manager and compass
+    /// stop too.
+    func quietMapLocation(of map: NavigationMapView) {
+        guard case .courseView? = map.userLocationStyle, let location = map.mapView.location else { return }
+        if location.options.puckType != nil { location.options.puckType = nil }
+        for consumer in location.consumers.allObjects {
+            location.removeLocationConsumer(consumer: consumer)
+        }
     }
 
     func setRate(_ rate: Int, on map: MapView) {
@@ -109,6 +124,31 @@ extension FlutterMapboxNavigationView {
         // Set to itself: that is what makes the SDK put its marker back.
         let style = navigationMapView.userLocationStyle
         navigationMapView.userLocationStyle = style
+    }
+}
+
+/// The driver's marker, animating at the map's rate.
+///
+/// The marker is a view, and on every tick the SDK slides it to the new
+/// position with a one-second animation. While the van moves it is
+/// therefore always animating, and the system puts the whole screen
+/// together again for each frame of that: up to 120 a second on a phone
+/// that can, four for every one the map draws. Measured on a drive, that
+/// cost twice what the app itself did. Asked to run at the map's own
+/// rate, the marker moves in step with the map under it.
+final class PacedPuckView: UserPuckCourseView {
+    override class var layerClass: AnyClass { PacedLayer.self }
+}
+
+/// A layer whose animations ask for the map's frame rate. The SDK makes
+/// the animations; this is the one place they all pass through.
+final class PacedLayer: CALayer {
+    override func add(_ animation: CAAnimation, forKey key: String?) {
+        if #available(iOS 15.0, *) {
+            let rate = Float(MapPower.moving)
+            animation.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+        }
+        super.add(animation, forKey: key)
     }
 }
 

@@ -96,6 +96,11 @@ extension NavigationFactory {
             // a tap anywhere near an alternative's line took it.
             map.tapGestureDistanceThreshold = 0
             HostMapColor.style(map)
+            // The SDK's own marker view, in a kind that animates at the
+            // map's rate (see PacedPuckView).
+            if case let .courseView(view)? = map.userLocationStyle, !(view is PacedPuckView) {
+                map.userLocationStyle = .courseView(PacedPuckView(frame: CGRect(origin: .zero, size: view.bounds.size)))
+            }
             if case let .courseView(view)? = map.userLocationStyle,
                let puck = view as? UserPuckCourseView {
                 HostMapColor.style(puck)
