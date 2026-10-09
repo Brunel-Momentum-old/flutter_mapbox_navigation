@@ -564,6 +564,9 @@ open class TurnByTurn(
         }
 
         override fun onNewRawLocation(rawLocation: Location) {
+            // A fix the location engine made up to hold a lost driver in
+            // place is not the phone speaking.
+            if (rawLocation.extras?.getBoolean(SteadyLocationEngine.MADE_UP) == true) return
             this@TurnByTurn.lastRawFixAtMs = SystemClock.elapsedRealtime()
         }
     }

@@ -2,6 +2,8 @@ package com.eopeter.fluttermapboxnavigation
 
 import android.app.PendingIntent
 import android.location.Location
+import android.os.Bundle
+import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.mapbox.android.core.location.LocationEngine
@@ -28,9 +30,20 @@ import kotlin.math.min
  * distrust the fix and freeze the route where it started.
  */
 class SteadyLocationEngine(private val source: LocationEngine) : LocationEngine {
+    companion object {
+        /** Marks a fix this engine made up, so the host does not count it as the phone speaking. */
+        const val MADE_UP = "hostMadeUpFix"
+
+        /** How long the phone may say nothing before a moving driver is taken to have been lost. */
+        private const val SILENCE_MS = 3000L
+    }
+
     private val steadier = LocationSteadier()
     private val relays =
         HashMap<LocationEngineCallback<LocationEngineResult>, LocationEngineCallback<LocationEngineResult>>()
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastReal: Location? = null
+    private val silence = Runnable { onSilence() }
 
     override fun getLastLocation(callback: LocationEngineCallback<LocationEngineResult>) {
         source.getLastLocation(callback)
@@ -43,6 +56,9 @@ class SteadyLocationEngine(private val source: LocationEngine) : LocationEngine 
     ) {
         val relay = object : LocationEngineCallback<LocationEngineResult> {
             override fun onSuccess(result: LocationEngineResult) {
+                result.lastLocation?.let { lastReal = it }
+                handler.removeCallbacks(silence)
+                handler.postDelayed(silence, SILENCE_MS)
                 callback.onSuccess(LocationEngineResult.create(result.locations.map(steadier::steadied)))
             }
 
@@ -59,12 +75,37 @@ class SteadyLocationEngine(private val source: LocationEngine) : LocationEngine 
     }
 
     override fun removeLocationUpdates(callback: LocationEngineCallback<LocationEngineResult>) {
-        val relay = synchronized(relays) { relays.remove(callback) }
+        val relay = synchronized(relays) {
+            val removed = relays.remove(callback)
+            if (relays.isEmpty()) handler.removeCallbacks(silence)
+            removed
+        }
         source.removeLocationUpdates(relay ?: callback)
     }
 
     override fun removeLocationUpdates(pendingIntent: PendingIntent?) {
         source.removeLocationUpdates(pendingIntent)
+    }
+
+    /**
+     * The phone has stopped reporting while the driver was moving. Left
+     * alone the navigator carries them on along the route at their last
+     * speed, as far as the stop. It is told once that they are standing
+     * where they were last seen, and holds them there until the phone
+     * speaks again.
+     */
+    private fun onSilence() {
+        val last = lastReal ?: return
+        if (!last.hasSpeed() || last.speed < LocationSteadier.MOVING_SPEED) return
+        val standing = Location(last).apply {
+            speed = 0f
+            time = System.currentTimeMillis()
+            elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+            extras = (extras ?: Bundle()).apply { putBoolean(MADE_UP, true) }
+        }
+        lastReal = standing
+        val listeners = synchronized(relays) { relays.keys.toList() }
+        for (listener in listeners) listener.onSuccess(LocationEngineResult.create(standing))
     }
 }
 
