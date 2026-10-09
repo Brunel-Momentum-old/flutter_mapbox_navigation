@@ -214,6 +214,39 @@ class NavState {
   final String? roadName;
 }
 
+/// A numbered pin for a stop, shown while the map is in overview.
+class NavStopPin {
+  const NavStopPin({
+    required this.latitude,
+    required this.longitude,
+    required this.label,
+    this.current = false,
+    this.partner = false,
+  });
+
+  final double latitude;
+  final double longitude;
+
+  /// What is written on the pin — the stop's number on the route, or for
+  /// a [partner] the tag under it ("Sam · waiting").
+  final String label;
+
+  /// The stop being driven to: drawn larger, with a halo.
+  final bool current;
+
+  /// Another driver's position rather than a stop: drawn as a person,
+  /// and shown in every camera mode, not just the overview.
+  final bool partner;
+
+  Map<String, Object?> toMap() => {
+        'latitude': latitude,
+        'longitude': longitude,
+        'label': label,
+        'current': current,
+        'kind': partner ? 'partner' : 'stop',
+      };
+}
+
 /// What the map camera is doing.
 enum NavCameraState {
   /// Tracking the driver.

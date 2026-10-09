@@ -51,6 +51,15 @@ import java.util.*
 /** How much faster an alternative has to be before it is offered. */
 private const val FASTER_ROUTE_MIN_SAVING_S = 120.0
 
+/** Map kept clear between the host's sheet and the centre of the puck. */
+private const val PUCK_CLEARANCE_DP = 72f
+
+/** Room for the host's floating buttons under its banner. */
+private const val CAMERA_TOP_MARGIN_DP = 64f
+
+/** Keeps the route and its pins off the screen edges in the overview. */
+private const val CAMERA_SIDE_MARGIN_DP = 32f
+
 open class TurnByTurn(
     ctx: Context,
     act: Activity,
@@ -120,7 +129,13 @@ open class TurnByTurn(
                 result.success(true)
             }
             "recenter", "reCenter" -> {
-                SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
+                if (this.mapLook.isDoorView) {
+                    SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Idle))
+                    this.sendCameraState("following")
+                    this.lastLocation?.let { this.mapLook.onLocation(it) }
+                } else {
+                    SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
+                }
                 result.success(true)
             }
             "setCameraPadding" -> {
@@ -132,6 +147,36 @@ open class TurnByTurn(
                     (methodCall.argument<Double>("right") ?: 0.0) * density,
                 )
                 this.applyHostPadding()
+                result.success(true)
+            }
+            "setStopPins" -> {
+                val pins = methodCall.argument<List<Map<*, *>>>("pins") ?: emptyList()
+                this.mapLook.setStopPins(pins)
+                result.success(true)
+            }
+            "setDoorView" -> {
+                val enabled = methodCall.argument<Boolean>("enabled") ?: false
+                val wasOn = this.mapLook.isDoorView
+                this.mapLook.setDoorView(
+                    enabled,
+                    methodCall.argument<String>("side"),
+                    methodCall.argument<Double>("latitude"),
+                    methodCall.argument<Double>("longitude"),
+                    methodCall.argument<String>("label"),
+                )
+                if (enabled && !wasOn) {
+                    // The door view drives the camera by hand.
+                    SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Idle))
+                    this.lastLocation?.let { this.mapLook.onLocation(it) }
+                } else if (!enabled && wasOn) {
+                    SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
+                }
+                result.success(true)
+            }
+            "setNightMode" -> {
+                this.nightMode = methodCall.argument<Boolean>("night") ?: false
+                this.mapLook.night = this.nightMode
+                this.applyMapStyleUris()
                 result.success(true)
             }
             "acceptFasterRoute" -> {
@@ -153,6 +198,7 @@ open class TurnByTurn(
         this.arrived = false
         this.lastProgress = null
         this.declinedAlternativeIds.clear()
+        this.mapLook.leaveDoorView()
 
         val arguments = methodCall.arguments as? Map<*, *>
         if (arguments != null) this.setOptions(arguments)
@@ -326,10 +372,7 @@ open class TurnByTurn(
         if (this.mapStyleUrlDay == null) this.mapStyleUrlDay = Style.MAPBOX_STREETS
         if (this.mapStyleUrlNight == null) this.mapStyleUrlNight = Style.DARK
 
-        this@TurnByTurn.binding.navigationView.customizeViewOptions {
-            mapStyleUriDay = this@TurnByTurn.mapStyleUrlDay
-            mapStyleUriNight = this@TurnByTurn.mapStyleUrlNight
-        }           
+        this.applyMapStyleUris()
 
         this.initialLatitude = arguments["initialLatitude"] as? Double
         this.initialLongitude = arguments["initialLongitude"] as? Double
@@ -476,6 +519,10 @@ open class TurnByTurn(
     private var hostPadding: EdgeInsets? = null
     private val declinedAlternativeIds = mutableSetOf<String>()
     private var fasterRouteSaving: Double? = null
+    private var nightMode = false
+
+    /** Route line, puck, stop pins and the door view. */
+    val mapLook: MapLook by lazy { MapLook(ctx, bind.navigationView) }
 
     /**
      * Bindings to the example layout.
@@ -492,6 +539,7 @@ open class TurnByTurn(
         override fun onNewLocationMatcherResult(locationMatcherResult: LocationMatcherResult) {
             this@TurnByTurn.lastLocation = locationMatcherResult.enhancedLocation
             this@TurnByTurn.speedLimitKmph = locationMatcherResult.speedLimit?.speedKmph
+            this@TurnByTurn.mapLook.onLocation(locationMatcherResult.enhancedLocation)
         }
 
         override fun onNewRawLocation(rawLocation: Location) {
@@ -544,19 +592,54 @@ open class TurnByTurn(
         override fun onIdleCameraMode() = sendCameraState("free")
         override fun onCameraPaddingChanged(padding: EdgeInsets) {
             val wanted = this@TurnByTurn.hostPadding ?: return
-            if (padding != wanted) this@TurnByTurn.applyHostPadding()
+            if (padding != cameraPadding(wanted)) this@TurnByTurn.applyHostPadding()
         }
     }
 
     private fun sendCameraState(state: String) {
-        if (state == this.cameraState) return
-        this.cameraState = state
-        PluginUtilities.sendEvent(MapBoxEvents.CAMERA_STATE, state)
+        // The door view parks Drop-In's camera on purpose; to the host
+        // the map is still following the driver.
+        val reported = if (state == "free" && this.mapLook.isDoorView) "following" else state
+        if (reported == this.cameraState) return
+        this.cameraState = reported
+        PluginUtilities.sendEvent(MapBoxEvents.CAMERA_STATE, reported)
+        this.mapLook.onCameraState(reported)
     }
 
     private fun applyHostPadding() {
         val padding = this.hostPadding ?: return
-        SharedApp.store.dispatch(CameraAction.UpdatePadding(padding))
+        this.mapLook.hostPadding = padding
+        SharedApp.store.dispatch(CameraAction.UpdatePadding(cameraPadding(padding)))
+    }
+
+    /**
+     * Drop-In's following camera centres the puck on the bottom edge of
+     * its padding, which left half of it behind the host's sheet, and its
+     * overview ran the route to the very edges of the screen. The camera
+     * gets room on every side on top of what the host covers.
+     */
+    private fun cameraPadding(host: EdgeInsets): EdgeInsets {
+        val density = this.context.resources.displayMetrics.density
+        return EdgeInsets(
+            host.top + CAMERA_TOP_MARGIN_DP * density,
+            host.left + CAMERA_SIDE_MARGIN_DP * density,
+            host.bottom + PUCK_CLEARANCE_DP * density,
+            host.right + CAMERA_SIDE_MARGIN_DP * density,
+        )
+    }
+
+    /**
+     * Drop-In picks its day or night URI from the phone's dark mode. The
+     * host decides instead (`setNightMode`), so both slots carry the
+     * style it asked for.
+     */
+    private fun applyMapStyleUris() {
+        val uri = if (this.nightMode) this.mapStyleUrlNight else this.mapStyleUrlDay
+        if (uri == null) return
+        this.binding.navigationView.customizeViewOptions {
+            mapStyleUriDay = uri
+            mapStyleUriNight = uri
+        }
     }
 
     /** The alternative worth offering right now, if any. */

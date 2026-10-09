@@ -169,6 +169,37 @@ class MapBoxNavigationViewController {
         'right': right,
       });
 
+  /// Stops to mark with numbered pins while the whole route is on
+  /// screen (overview). Replaces any earlier set; an empty list clears.
+  Future<void> setStopPins(List<NavStopPin> pins) =>
+      _methodChannel.invokeMethod<void>('setStopPins', {
+        'pins': [for (final pin in pins) pin.toMap()],
+      });
+
+  /// Turns the door view on or off: a close, low camera pushed toward
+  /// the stop's [side] of the street (`left` / `right`), house numbers on
+  /// every building, and the building at [latitude], [longitude] marked
+  /// with [label]. Call again with new values to update it.
+  Future<void> setDoorView({
+    required bool enabled,
+    String? side,
+    double? latitude,
+    double? longitude,
+    String? label,
+  }) =>
+      _methodChannel.invokeMethod<void>('setDoorView', {
+        'enabled': enabled,
+        'side': side,
+        'latitude': latitude,
+        'longitude': longitude,
+        'label': label,
+      });
+
+  /// Switches the map between its day and night styles. The host
+  /// decides, so its own chrome and the map never disagree.
+  Future<void> setNightMode({required bool night}) =>
+      _methodChannel.invokeMethod<void>('setNightMode', {'night': night});
+
   /// Switches to the faster route on offer in [NavState.fasterRoute].
   /// Completes with false when there is none.
   Future<bool> acceptFasterRoute() async =>

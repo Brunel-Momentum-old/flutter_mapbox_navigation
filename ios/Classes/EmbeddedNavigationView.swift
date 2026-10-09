@@ -105,6 +105,21 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
                 strongSelf.applyCameraPadding()
                 result(true)
             }
+            else if(call.method == "setStopPins")
+            {
+                strongSelf.setStopPins(arguments?["pins"] as? [[String: Any]] ?? [])
+                result(true)
+            }
+            else if(call.method == "setDoorView")
+            {
+                strongSelf.setDoorView(arguments: arguments)
+                result(true)
+            }
+            else if(call.method == "setNightMode")
+            {
+                strongSelf.setNightMode(arguments?["night"] as? Bool ?? false)
+                result(true)
+            }
             else if(call.method == "acceptFasterRoute")
             {
                 strongSelf.acceptFasterRoute(result: result)

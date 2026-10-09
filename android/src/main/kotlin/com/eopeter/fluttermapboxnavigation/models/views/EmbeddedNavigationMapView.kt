@@ -20,6 +20,7 @@ import com.mapbox.navigation.dropin.map.MapViewBinder
 import com.mapbox.navigation.dropin.map.MapViewObserver
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.platform.PlatformView
 import org.json.JSONObject
@@ -53,6 +54,37 @@ class EmbeddedNavigationMapView(
     }
     private var dropInReady = false
 
+    // Starting Drop-In sets the navigation SDK up afresh. A route asked
+    // for before that was thrown away with the old instance and the screen
+    // sat on its spinner, so calls wait here until Drop-In has started.
+    private var dropInStarted = false
+    private val heldCalls = ArrayList<Pair<MethodCall, MethodChannel.Result>>()
+    private val neverHeld = setOf(
+        "getPlatformVersion",
+        "finishNavigation",
+        "getDistanceRemaining",
+        "getDurationRemaining",
+    )
+
+    override fun onMethodCall(methodCall: MethodCall, result: MethodChannel.Result) {
+        if (!dropInStarted && methodCall.method !in neverHeld) {
+            heldCalls.add(methodCall to result)
+            return
+        }
+        if (!dropInStarted && methodCall.method == "finishNavigation") {
+            releaseHeldCalls(run = false)
+        }
+        super.onMethodCall(methodCall, result)
+    }
+
+    private fun releaseHeldCalls(run: Boolean) {
+        val calls = ArrayList(heldCalls)
+        heldCalls.clear()
+        for ((call, result) in calls) {
+            if (run) super.onMethodCall(call, result) else result.success(false)
+        }
+    }
+
     override fun initFlutterChannelHandlers() {
         methodChannel = MethodChannel(messenger, "flutter_mapbox_navigation/${viewId}")
         eventChannel = EventChannel(messenger, "flutter_mapbox_navigation/${viewId}/events")
@@ -82,6 +114,12 @@ class EmbeddedNavigationMapView(
         // TextureView works inside Flutter platform views; SurfaceView stalls at 0x0.
         this.binding.navigationView.customizeViewBinders {
             mapViewBinder = object : MapViewBinder() {
+                // A custom binder leaves the style alone by default, so
+                // the map sat on MapView's built-in Streets style and
+                // ignored mapStyleUrlDay / mapStyleUrlNight. Let Drop-In
+                // load the style the host asked for.
+                override val shouldLoadMapStyle: Boolean = true
+
                 override fun getMapView(ctx: Context): MapView {
                     val options = MapInitOptions(
                         context = ctx,
@@ -122,6 +160,22 @@ class EmbeddedNavigationMapView(
         if ((this.arguments?.get("enableOnMapTapCallback") as? Boolean ?: false)) {
             this.binding.navigationView.registerMapObserver(onMapClick)
         }
+
+        this.mapLook.applyStyle()
+        this.binding.navigationView.registerMapObserver(mapLookObserver)
+
+        dropInStarted = true
+        releaseHeldCalls(run = true)
+    }
+
+    private val mapLookObserver = object : MapViewObserver() {
+        override fun onAttached(mapView: MapView) {
+            mapLook.onMapAttached(mapView)
+        }
+
+        override fun onDetached(mapView: MapView) {
+            mapLook.onMapDetached()
+        }
     }
 
     override fun getView(): View {
@@ -132,6 +186,8 @@ class EmbeddedNavigationMapView(
         if ((this.arguments?.get("enableOnMapTapCallback") as? Boolean ?: false)) {
             this.binding.navigationView.unregisterMapObserver(onMapClick)
         }
+        this.binding.navigationView.unregisterMapObserver(mapLookObserver)
+        releaseHeldCalls(run = false)
         unregisterObservers()
     }
 

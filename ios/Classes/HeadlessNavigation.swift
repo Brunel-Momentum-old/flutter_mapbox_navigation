@@ -73,6 +73,8 @@ extension NavigationFactory {
         // A faster route is offered to the driver, never taken for them.
         navigationViewController.navigationService.router.reroutesProactively = false
 
+        applyMapLook(navigationViewController)
+
         NotificationCenter.default.removeObserver(self, name: .navigationCameraStateDidChange, object: nil)
         NotificationCenter.default.addObserver(self,
                                                selector: #selector(headlessCameraStateDidChange(_:)),
@@ -101,7 +103,9 @@ extension NavigationFactory {
             // camera, so wait a beat for the gesture to register, and
             // otherwise put the camera back where the host asked for it.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                guard let self = self,
+                // The door view drives the camera by hand; idle is its
+                // normal state, not something to undo or report.
+                guard let self = self, self._doorView == nil,
                       let camera = self._navigationViewController?.navigationMapView?.navigationCamera,
                       camera.state == .idle else { return }
                 if self.userIsMovingMap() {
@@ -115,10 +119,11 @@ extension NavigationFactory {
         }
     }
 
-    private func reportCameraState(_ value: String) {
+    func reportCameraState(_ value: String) {
         guard value != _cameraState else { return }
         _cameraState = value
         sendEvent(eventType: MapBoxEventType.camera_state, data: value)
+        refreshStopPins()
     }
 
     /// True while, or just after, the driver's fingers moved the map.
@@ -145,6 +150,8 @@ extension NavigationFactory {
         _topSpacer?.height = max(0, _cameraPaddingTop - safeArea.top)
         _bottomSpacer?.height = max(0, _cameraPaddingBottom - safeArea.bottom)
         navigationViewController.view.setNeedsLayout()
+        // After the SDK has laid its own ornaments out for the new height.
+        DispatchQueue.main.async { [weak self] in self?.placeOrnaments() }
     }
 
     func setMuted(_ muted: Bool) {
@@ -158,6 +165,12 @@ extension NavigationFactory {
 
     func recenter() {
         _overviewRequested = false
+        // In the door view the camera is driven by hand on every tick.
+        guard _doorView == nil else {
+            reportCameraState("following")
+            updateDoorView(duration: 0.6)
+            return
+        }
         _navigationViewController?.navigationMapView?.navigationCamera.follow()
     }
 
@@ -202,6 +215,10 @@ extension NavigationFactory {
         _cameraState = nil
         _overviewRequested = false
         _lastUserGestureAt = nil
+        _doorView = nil
+        _stopPinManager = nil
+        _doorPointManager = nil
+        _doorPolygonManager = nil
     }
 
     /// Sends the latest guidance state to the host. Safe to call at any

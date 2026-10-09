@@ -80,6 +80,14 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _cameraState: String?
     var _overviewRequested = false
     var _lastUserGestureAt: Date?
+
+    // Map look, stop pins and door view — see MapLook.swift.
+    var _nightMode = false
+    var _stopPins: [[String: Any]] = []
+    var _stopPinManager: PointAnnotationManager?
+    var _doorView: DoorView?
+    var _doorPointManager: PointAnnotationManager?
+    var _doorPolygonManager: PolygonAnnotationManager?
     var _offRoute = false
     var _rerouting = false
     var _declinedAlternatives = Set<AlternativeRoute.ID>()
@@ -504,6 +512,8 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         }
         _lastProgress = progress
         emitNavState()
+        updateDoorView()
+        placeOrnaments()
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didArriveAt waypoint: Waypoint) -> Bool {
@@ -561,6 +571,12 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         emitNavState()
     }
     
+    /// The stop is marked with the host's own numbered pin, so the SDK's
+    /// stock destination marker is taken off again.
+    public func navigationViewController(_ navigationViewController: NavigationViewController, didAdd finalDestinationAnnotation: PointAnnotation, pointAnnotationManager: PointAnnotationManager) {
+        pointAnnotationManager.annotations = []
+    }
+
     public func navigationViewController(_ navigationViewController: NavigationViewController, didSubmitArrivalFeedback feedback: EndOfRouteFeedback) {
         
         if(_eventSink != nil)
