@@ -19,6 +19,8 @@ enum HostMapColor {
     static let buildingFill = UIColor(red: 0xBF / 255.0, green: 0xDC / 255.0, blue: 0xCB / 255.0, alpha: 1)
     static let ink = UIColor(red: 0x2B / 255.0, green: 0x2B / 255.0, blue: 0x2B / 255.0, alpha: 1)
     static let leftRoute = UIColor(red: 0x8E / 255.0, green: 0x8B / 255.0, blue: 0x83 / 255.0, alpha: 1)
+    static let tip = UIColor(red: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1C / 255.0, alpha: 1)
+    static let tipGreen = UIColor(red: 0x1F / 255.0, green: 0x5A / 255.0, blue: 0x37 / 255.0, alpha: 1)
 
     /// Route line, casing, traffic and puck colours, applied through the
     /// appearance proxy by the day and night styles. Set per idiom, the
@@ -77,9 +79,22 @@ extension NavigationFactory {
             navigationViewController.styleManager?.applyStyle(type: .night)
         }
         if let map = navigationViewController.navigationMapView {
+            // Heading up, always, with the driver's marker in one place.
+            // By default the camera looks towards the next turn, up to
+            // 45 degrees off the way the driver is going, so on a curving
+            // road the marker's arrow swung round while the map stayed
+            // put; and near a turn it flattened and slid over to frame
+            // the turn, taking the marker off its spot.
+            if let viewport = map.navigationCamera.viewportDataSource as? NavigationViewportDataSource {
+                viewport.options.followingCameraOptions.bearingSmoothing.enabled = false
+                viewport.options.followingCameraOptions.pitchNearManeuver.enabled = false
+            }
             // The host offers a faster route in its own card; the SDK's
             // "2 min slower" bubbles on every alternative are noise.
             map.showsRelativeDurationOnContinuousAlternativeRoutes = false
+            // And nothing switches route without that card: left alone,
+            // a tap anywhere near an alternative's line took it.
+            map.tapGestureDistanceThreshold = 0
             HostMapColor.style(map)
             if case let .courseView(view)? = map.userLocationStyle,
                let puck = view as? UserPuckCourseView {
@@ -92,6 +107,144 @@ extension NavigationFactory {
         guard night != _nightMode else { return }
         _nightMode = night
         _navigationViewController?.styleManager?.applyStyle(type: night ? .night : .day)
+        // The new style drops the layers drawn here. Forgetting what is
+        // on the map makes the next tick draw it again.
+        _fasterRouteOnMap = nil
+        _shownTags = ""
+    }
+
+    // MARK: Tags on the map: the next turn, and a faster route
+
+    /// The street the next turn goes onto, tagged at the turn.
+    func tagNextTurn(_ progress: RouteProgress) {
+        let step = progress.currentLegProgress.upcomingStep
+        let street = progress.currentLegProgress.currentStepProgress.currentVisualInstruction?.primaryInstruction.text
+            ?? step?.names?.first
+        // Arriving is not a turn: the door view marks the stop itself.
+        if let step = step, step.maneuverType != .arrive, let street = street, !street.isEmpty {
+            _turnTag = (step.maneuverLocation, street)
+        } else {
+            _turnTag = nil
+        }
+        refreshTags()
+    }
+
+    /// Draws the faster route on offer, or takes it off when the offer
+    /// has gone: the part of it that leaves the route in use, in green,
+    /// with "N min faster" on it and "Yours" on the route in use.
+    func showFasterRouteOnMap(_ faster: AlternativeRoute?) {
+        guard faster?.id != _fasterRouteOnMap else { return }
+        _fasterRouteOnMap = faster?.id
+        guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
+        let style = mapView.mapboxMap.style
+        let id = "host-faster-route"
+        for layer in [id, id + "-casing"] where style.layerExists(withId: layer) {
+            try? style.removeLayer(withId: layer)
+        }
+        if style.sourceExists(withId: id) { try? style.removeSource(withId: id) }
+        _fasterTips = []
+        defer { refreshTags() }
+
+        guard let faster = faster,
+              let whole = faster.indexedRouteResponse.currentRoute?.shape,
+              let end = whole.coordinates.last,
+              // Only where it leaves the route in use: the shared stretch
+              // stays the colour of the route the driver is on.
+              let branch = whole.sliced(from: faster.alternativeRouteIntersection.location, to: end) else { return }
+        var source = GeoJSONSource()
+        source.data = .geometry(.lineString(branch))
+        try? style.addSource(source, id: id)
+        var casing = LineLayer(id: id + "-casing")
+        casing.source = id
+        casing.lineColor = .constant(StyleColor(.white))
+        casing.lineWidth = .constant(12)
+        casing.lineCap = .constant(.round)
+        casing.lineJoin = .constant(.round)
+        var line = LineLayer(id: id)
+        line.source = id
+        line.lineColor = .constant(StyleColor(HostMapColor.green))
+        line.lineWidth = .constant(7)
+        line.lineCap = .constant(.round)
+        line.lineJoin = .constant(.round)
+        let main = style.allLayerIdentifiers.map { $0.id }.last { $0.hasSuffix(".main.route_line") }
+        if let main = main {
+            try? style.addLayer(casing, layerPosition: .above(main))
+        } else {
+            try? style.addLayer(casing)
+        }
+        try? style.addLayer(line, layerPosition: .above(id + "-casing"))
+
+        let minutes = max(1, Int((-faster.expectedTravelTimeDelta / 60).rounded()))
+        if let length = branch.distance(), let at = branch.coordinateFromStart(distance: length * 0.4) {
+            _fasterTips.append((at, "\(minutes) min faster"))
+        }
+        if let mine = _lastProgress?.route.shape, let mineEnd = mine.coordinates.last,
+           let rest = mine.sliced(from: faster.mainRouteIntersection.location, to: mineEnd),
+           let length = rest.distance(), let at = rest.coordinateFromStart(distance: length * 0.4) {
+            _fasterTips.append((at, "Yours"))
+        }
+    }
+
+    /// One manager for both kinds of tag.
+    func refreshTags() {
+        guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
+        // The door view has the stop's own marking, and the overview is
+        // for the shape of the trip. The faster route's tags stay in any
+        // view: the host switches to the overview when it offers one.
+        let overview = _cameraState == "overview"
+        let turn = (_doorView == nil && !overview && _fasterTips.isEmpty) ? _turnTag : nil
+        let key = [turn.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? ""]
+            + _fasterTips.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" }
+        let joined = key.joined(separator: ";") + (_nightMode ? "n" : "d")
+        guard joined != _shownTags else { return }
+        _shownTags = joined
+        if _tagManager == nil {
+            _tagManager = mapView.annotations.makePointAnnotationManager(id: "host-tags")
+        }
+        var tags: [PointAnnotation] = []
+        if let turn = turn {
+            var tag = PointAnnotation(coordinate: turn.0)
+            tag.image = .init(image: Self.tagImage(turn.1, fill: HostMapColor.tip, pointer: true), name: "host-turn-\(turn.1)")
+            tag.iconAnchor = .bottom
+            tag.iconOffset = [0, -8]
+            tags.append(tag)
+        }
+        for (at, text) in _fasterTips {
+            var tag = PointAnnotation(coordinate: at)
+            let yours = text == "Yours"
+            tag.image = .init(image: Self.tagImage(text, fill: yours ? HostMapColor.tip : HostMapColor.tipGreen, pointer: false),
+                              name: "host-tip-\(text)")
+            tag.symbolSortKey = yours ? 0 : 1
+            tags.append(tag)
+        }
+        _tagManager?.annotations = tags
+    }
+
+    /// A dark or green rounded tag with white text; `pointer` adds a tail
+    /// pointing down.
+    static func tagImage(_ text: String, fill: UIColor, pointer: Bool) -> UIImage {
+        let font = UIFont.systemFont(ofSize: pointer ? 14 : 16, weight: .bold)
+        let label = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: UIColor.white])
+        let textSize = label.size()
+        let bubble = CGSize(width: textSize.width + 24, height: pointer ? 31 : 36)
+        let tail: CGFloat = pointer ? 9 : 0
+        let size = CGSize(width: bubble.width + 4, height: bubble.height + tail + 4)
+        return UIGraphicsImageRenderer(size: size).image { context in
+            let cg = context.cgContext
+            let rect = CGRect(x: 2, y: 2, width: bubble.width, height: bubble.height)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: pointer ? 9 : 12)
+            if pointer {
+                path.move(to: CGPoint(x: rect.midX - 8, y: rect.maxY - 1))
+                path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY + tail))
+                path.addLine(to: CGPoint(x: rect.midX + 8, y: rect.maxY - 1))
+                path.close()
+            }
+            cg.setShadow(offset: CGSize(width: 0, height: 1), blur: 3, color: UIColor.black.withAlphaComponent(0.3).cgColor)
+            fill.setFill()
+            path.fill()
+            cg.setShadow(offset: .zero, blur: 0, color: nil)
+            label.draw(at: CGPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2))
+        }
     }
 
     // MARK: Route look
@@ -110,8 +263,11 @@ extension NavigationFactory {
         let style = mapView.mapboxMap.style
         // The SDK names its layers after the route object; the suffixes
         // are what is stable.
+        // The third is the travelled-route layer, which runs the whole
+        // length of the route under the other two.
         let mainLine = style.allLayerIdentifiers.map { $0.id }.filter {
             $0.hasSuffix(".main.route_line") || $0.hasSuffix(".main.route_line_casing")
+                || $0.hasSuffix(".traversed_route")
         }
         let opacity: Double
         switch _routeLook {
@@ -177,6 +333,9 @@ extension NavigationFactory {
     /// Later stops show as numbered pins while the whole route is on
     /// screen, and stay out of the way while following.
     func refreshStopPins() {
+        // Whatever changed the pins (the camera, the door view) changes
+        // which tags belong on the map too.
+        refreshTags()
         guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
         if _stopPinManager == nil {
             _stopPinManager = mapView.annotations.makePointAnnotationManager(id: "host-stop-pins")
@@ -315,6 +474,9 @@ extension NavigationFactory {
     /// camera on the driver, and keeps trying to mark the building until
     /// it has scrolled into view and can be found.
     func updateDoorView(duration: TimeInterval = 1.0) {
+        // The driver asked for the whole trip: the door camera waits
+        // until they re-centre, or the two fight over the map each tick.
+        guard !_overviewRequested else { return }
         guard var door = _doorView,
               let map = _navigationViewController?.navigationMapView,
               let location = _lastKnownLocation ?? map.mapView.location.latestLocation?.location else { return }

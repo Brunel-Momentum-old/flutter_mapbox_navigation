@@ -41,7 +41,7 @@ final class SpacerBannerViewController: ContainerViewController {
 }
 
 /// How much faster an alternative has to be before it is offered.
-let fasterRouteMinimumSaving: TimeInterval = 120
+let defaultFasterRouteMinimumSaving: TimeInterval = 120
 
 extension NavigationFactory {
 
@@ -188,7 +188,7 @@ extension NavigationFactory {
         guard let router = _navigationViewController?.navigationService.router else { return nil }
         return router.continuousAlternatives
             .filter { !_declinedAlternatives.contains($0.id) }
-            .filter { $0.expectedTravelTimeDelta <= -fasterRouteMinimumSaving }
+            .filter { $0.expectedTravelTimeDelta <= -_fasterRouteMinimumSaving }
             .min { $0.expectedTravelTimeDelta < $1.expectedTravelTimeDelta }
     }
 
@@ -198,11 +198,16 @@ extension NavigationFactory {
             result(false)
             return
         }
-        router.updateRoute(with: alternative.indexedRouteResponse, routeOptions: nil) { [weak self] success in
-            if success {
-                self?.sendEvent(eventType: MapBoxEventType.reroute_along)
-            }
+        // The router tells its delegate about the switch, which sends the
+        // host its event; and it calls nobody back if the trip is already
+        // over, so the host is answered either way.
+        var answered = false
+        router.updateRoute(with: alternative.indexedRouteResponse, routeOptions: nil) { success in
+            answered = true
             result(success)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            if !answered { result(false) }
         }
     }
 
@@ -222,16 +227,18 @@ extension NavigationFactory {
         _cameraState = nil
         _overviewRequested = false
         _lastUserGestureAt = nil
-        _doorView = nil
-        _stopPinManager = nil
-        _doorPointManager = nil
-        _doorPolygonManager = nil
+        releaseTripObjects()
     }
 
     /// Sends the latest guidance state to the host. Safe to call at any
     /// time; does nothing until the first progress update.
     func emitNavState() {
-        guard isEmbeddedNavigation, _eventSink != nil, let progress = _lastProgress else { return }
+        // While the navigator is still where the last trip ended, what it
+        // says about this one is not true yet; the host keeps its
+        // "finding the route" state for the second or two it takes.
+        guard isEmbeddedNavigation, _eventSink != nil, !_navigatorBehind, let progress = _lastProgress else { return }
+        showFasterRouteOnMap(!_offRoute && !_rerouting ? fasterAlternative() : nil)
+        tagNextTurn(progress)
         guard let data = try? JSONSerialization.data(withJSONObject: navState(for: progress), options: []),
               let json = String(data: data, encoding: .utf8) else { return }
         sendEvent(eventType: MapBoxEventType.nav_state, data: json)

@@ -63,100 +63,100 @@ struct LocationSteadier {
     /// within a second.
     static let movingSpeed: CLLocationSpeed = 0.7
 
-    /// A phone that reports no speed gives nothing to go on but where its
-    /// fixes land. This many in a row landing together is a driver who
-    /// has stopped.
-    static let quietFixesToRest = 4
-
     /// A fix this old when it arrives is CoreLocation's cached one, not
     /// where the driver is now.
     static let staleAfter: TimeInterval = 10
 
-    /// At rest, the spot is moved to a newer fix of equal or better
-    /// accuracy this often, so an early poor fix cannot pin the driver in
-    /// the wrong place for long.
+    /// At rest, the spot is moved to the newest fix this often, so one
+    /// poor fix cannot pin the driver in the wrong place for long.
     static let refreshRestEvery: TimeInterval = 30
+
+    /// How many of the latest fixes are looked at to tell a driver from a
+    /// phone that is only wandering.
+    static let windowSize = 6
 
     /// Where the driver is taken to be standing. Nil while they are, or
     /// may be, moving.
     private var held: CLLocation?
     private var heldSince = Date.distantPast
 
-    /// The latest fixes while not at rest, for telling when a driver
-    /// with no speed reading has stopped.
-    private var recent: [CLLocation] = []
+    /// The latest fresh fixes, whatever was done with them.
+    private var window: [CLLocation] = []
 
     mutating func steadied(_ fix: CLLocation, now: Date = Date()) -> CLLocation {
         // Not a usable fix, or a cached one: the SDK has its own handling
-        // for those, and neither says where the driver is at rest.
+        // for those, and neither says where the driver is now.
         guard fix.horizontalAccuracy >= 0,
               now.timeIntervalSince(fix.timestamp) <= Self.staleAfter else { return fix }
 
+        window.append(fix)
+        if window.count > Self.windowSize { window.removeFirst() }
+
         if fix.speed >= Self.movingSpeed {
-            moving()
+            held = nil
             return fix
         }
 
         if let spot = held {
-            // A clearly better fix, or the regular refresh, moves the spot.
-            let better = fix.horizontalAccuracy <= spot.horizontalAccuracy * 0.67
-            let due = now.timeIntervalSince(heldSince) >= Self.refreshRestEvery
-                && fix.horizontalAccuracy <= spot.horizontalAccuracy
-            if better || due {
+            if now.timeIntervalSince(heldSince) >= Self.refreshRestEvery {
                 rest(at: fix, now: now)
                 return fix
             }
-            if fix.distance(from: spot) <= Self.slack(for: fix) {
-                return CLLocation(coordinate: spot.coordinate,
-                                  altitude: fix.altitude,
-                                  horizontalAccuracy: fix.horizontalAccuracy,
-                                  verticalAccuracy: fix.verticalAccuracy,
-                                  course: spot.course,
-                                  speed: 0,
-                                  timestamp: fix.timestamp)
+            // Further than wander explains, or fixes that line up one
+            // after another: they have moved.
+            if fix.distance(from: spot) > Self.slack(for: fix) || goingSomewhere {
+                held = nil
+                return fix
             }
-            // Further than wander explains: they have moved.
-            moving()
-            recent = [fix]
-            return fix
+            return CLLocation(coordinate: spot.coordinate,
+                              altitude: fix.altitude,
+                              horizontalAccuracy: fix.horizontalAccuracy,
+                              verticalAccuracy: fix.verticalAccuracy,
+                              course: spot.course,
+                              speed: 0,
+                              timestamp: fix.timestamp)
         }
 
         // Not at rest. Every fix passes; the only question is whether
         // this one shows the driver has stopped.
         if fix.speed >= 0 {
-            // The phone measures speed and says "not moving".
-            rest(at: fix, now: now)
-            return fix
-        }
-        recent.append(fix)
-        if recent.count > Self.quietFixesToRest { recent.removeFirst() }
-        if recent.count == Self.quietFixesToRest,
-           let first = recent.first,
-           recent.allSatisfy({ $0.distance(from: first) <= Self.slack(for: fix) }) {
+            // The phone measures speed and says "not moving". It is
+            // believed unless the fixes themselves are plainly travelling
+            // (a speed reading stuck at zero).
+            if !goingSomewhere { rest(at: fix, now: now) }
+        } else if window.count >= 4, let first = window.first, !goingSomewhere,
+                  window.allSatisfy({ $0.distance(from: first) <= Self.slack(for: fix) }) {
+            // No speed reading at all: only where the fixes land. Several
+            // in a row that stay together and do not line up is a phone
+            // that is not going anywhere.
             rest(at: fix, now: now)
         }
         return fix
     }
 
-    private mutating func moving() {
-        held = nil
-        recent.removeAll()
+    /// A driver's fixes line up one after another; a parked phone's
+    /// wander doubles back on itself. True when the latest fixes cover
+    /// real ground and most of it is in one direction.
+    private var goingSomewhere: Bool {
+        guard window.count >= 4, let first = window.first, let last = window.last else { return false }
+        var path: CLLocationDistance = 0
+        for (a, b) in zip(window, window.dropFirst()) { path += b.distance(from: a) }
+        guard path >= 15 else { return false }
+        return last.distance(from: first) / path >= 0.8
     }
 
     private mutating func rest(at fix: CLLocation, now: Date) {
         held = fix
         heldSince = now
-        recent.removeAll()
     }
 
     /// How far a fix may land from the spot and still count as the same
-    /// spot. A phone that says "not moving" is believed over a wide
-    /// margin: its speed is measured, its position is the part that
-    /// wanders. With no speed at all there is less to go on, so less is
-    /// forgiven.
+    /// spot: twice its own error, within bounds. With a speed reading the
+    /// bounds are tight, so a driver crawling under walking pace is never
+    /// left far behind; without one there is only position to go on.
     static func slack(for fix: CLLocation) -> CLLocationDistance {
         if fix.speed >= 0 {
-            return min(max(fix.horizontalAccuracy * 3, 30), 75)
+            return min(max(fix.horizontalAccuracy * 2, 15), 30)
         }
         return min(max(fix.horizontalAccuracy * 2, 10), 40)
     }

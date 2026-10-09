@@ -206,6 +206,14 @@ class MapBoxNavigationViewController {
   Future<void> setRouteLook(NavRouteLook look) =>
       _methodChannel.invokeMethod<void>('setRouteLook', {'look': look.name});
 
+  /// How many seconds faster an alternative route has to be before it is
+  /// offered in [NavState.fasterRoute]. The plugin starts at 120.
+  Future<void> setFasterRouteMinimumSaving(double seconds) =>
+      _methodChannel.invokeMethod<void>(
+        'setFasterRouteMinimumSaving',
+        {'seconds': seconds},
+      );
+
   /// Switches to the faster route on offer in [NavState.fasterRoute].
   /// Completes with false when there is none.
   Future<bool> acceptFasterRoute() async =>

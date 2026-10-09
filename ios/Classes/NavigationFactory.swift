@@ -88,6 +88,15 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _doorView: DoorView?
     var _doorPointManager: PointAnnotationManager?
     var _doorPolygonManager: PolygonAnnotationManager?
+    var _tagManager: PointAnnotationManager?
+    var _turnTag: (CLLocationCoordinate2D, String)?
+    var _fasterTips: [(CLLocationCoordinate2D, String)] = []
+    var _shownTags = ""
+    var _fasterRouteOnMap: AlternativeRoute.ID?
+
+    /// How much faster an alternative has to be before it is offered.
+    /// The host may change it (`setFasterRouteMinimumSaving`).
+    var _fasterRouteMinimumSaving: TimeInterval = defaultFasterRouteMinimumSaving
     var _offRoute = false
     var _lastRawFixAt: Date?
     var _guidanceStartedAt: Date?
@@ -95,7 +104,14 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     /// This trip began with the navigator still standing where the last
     /// one ended, and it has not yet taken in where the driver is.
     var _navigatorBehind = false
+    /// The trip's route is to be set again once the navigator has the
+    /// phone's position. Outlives `_navigatorBehind`: the host stops being
+    /// kept waiting after a few seconds, the route still gets set.
+    var _routeNeedsSettingAgain = false
     var _noRerouteUntil: Date?
+    /// When re-routes were first held back because the navigator and the
+    /// phone disagree about where the driver is.
+    var _rerouteHeldSince: Date?
     var _routeLook = "normal"
     var _rerouting = false
     var _declinedAlternatives = Set<AlternativeRoute.ID>()
@@ -365,6 +381,23 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         service.router.finishRouting()
     }
 
+    /// Lets go of everything that belongs to the trip's map, which has
+    /// just been taken down: the managers point at a map that is gone,
+    /// and holding them kept that map alive.
+    func releaseTripObjects() {
+        _stopPinManager = nil
+        _doorPointManager = nil
+        _doorPolygonManager = nil
+        _tagManager = nil
+        _shownTags = ""
+        _turnTag = nil
+        _fasterTips = []
+        _fasterRouteOnMap = nil
+        _routeLook = "normal"
+        _doorView = nil
+        _lastProgress = nil
+    }
+
     func endNavigation(result: FlutterResult?)
     {
         navTrace("finishNavigation asked, live trip: \(_navigationViewController != nil)")
@@ -380,6 +413,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
             navigationViewController.view.removeFromSuperview()
             navigationViewController.removeFromParent()
             self._navigationViewController = nil
+            releaseTripObjects()
             result?(true)
         }
         else if(navigationViewController.presentingViewController != nil)
@@ -513,6 +547,13 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         _lastKnownLocation = location
         _lastRawFixAt = rawLocation.timestamp
         settleNavigator(navigationViewController, at: location, phone: rawLocation)
+        // A re-route that fails, or that the navigator drops, tells nobody
+        // it is over. A driver back on the route was left "off route" for
+        // the rest of the trip: the route hidden, no door view.
+        if (_offRoute || _rerouting), navigationViewController.navigationService.router.userIsOnRoute(location) {
+            _offRoute = false
+            _rerouting = false
+        }
         navTrace("tick lat=\(String(format: "%.5f", location.coordinate.latitude)) lng=\(String(format: "%.5f", location.coordinate.longitude)) course=\(Int(location.course)) speed=\(String(format: "%.1f", location.speed)) rawOffset=\(Int(location.distance(from: rawLocation))) rawAge=\(String(format: "%.1f", Date().timeIntervalSince(rawLocation.timestamp))) remaining=\(Int(progress.distanceRemaining)) toManeuver=\(Int(progress.currentLegProgress.currentStepProgress.distanceRemaining)) offRoute=\(_offRoute) rerouting=\(_rerouting) cam=\(String(describing: navigationViewController.navigationMapView?.navigationCamera.state)) camBearing=\(Int(navigationViewController.navigationMapView?.mapView.cameraState.bearing ?? -1))")
         _distanceRemaining = progress.distanceRemaining
         _durationRemaining = progress.durationRemaining
@@ -542,7 +583,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         // While the navigator is still where the last trip ended, what it
         // says about this one is not true yet; the host keeps its
         // "finding the route" state for the second or two it takes.
-        if !_navigatorBehind { emitNavState() }
+        emitNavState()
         updateDoorView()
         placeOrnaments()
         if _routeLook != "normal" { applyRouteLook() }
@@ -607,6 +648,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             let started = Date()
             _guidanceStartedAt = started
             _navigatorBehind = behind
+            _routeNeedsSettingAgain = behind
             if behind {
                 navTrace("trip starts with the navigator \(Int(navigator.distance(from: phone))) m from the phone")
                 // It catches up within a few fixes. If the fixes never
@@ -620,8 +662,10 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             }
             return
         }
-        guard _navigatorBehind, !behind else { return }
+        guard !behind else { return }
         _navigatorBehind = false
+        guard _routeNeedsSettingAgain else { return }
+        _routeNeedsSettingAgain = false
         // A moment for the navigator to take the route in again before a
         // re-route may be asked for.
         _noRerouteUntil = Date().addingTimeInterval(3)
@@ -647,10 +691,22 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         return max(25, fix.horizontalAccuracy * 2) + 1.5 * max(0, fix.speed)
     }
 
+    /// Longest a re-route is held back because the navigator and the
+    /// phone disagree. Past this the driver needs a route more than the
+    /// route needs to be from exactly the right spot.
+    static let rerouteHoldLimit: TimeInterval = 10
+
     func mayReroute(from fix: CLLocation) -> Bool {
-        guard let navigator = _lastKnownLocation, !_navigatorBehind else { return false }
+        guard let navigator = _lastKnownLocation else { return false }
         if let until = _noRerouteUntil, Date() < until { return false }
-        return navigator.distance(from: fix) <= Self.navigatorSlack(for: fix)
+        let agree = !_navigatorBehind && navigator.distance(from: fix) <= Self.navigatorSlack(for: fix)
+        if agree {
+            _rerouteHeldSince = nil
+            return true
+        }
+        let since = _rerouteHeldSince ?? Date()
+        _rerouteHeldSince = since
+        return Date().timeIntervalSince(since) >= Self.rerouteHoldLimit
     }
 
     public func navigationViewController(_ navigationViewController: NavigationViewController, willRerouteFrom location: CLLocation?) {

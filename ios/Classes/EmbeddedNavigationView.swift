@@ -40,7 +40,11 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
 
         super.init()
 
-        self.eventChannel.setStreamHandler(self)
+        // Through a go-between that holds this view weakly. The engine
+        // keeps its stream handler for good; handed the view itself, it
+        // kept every trip's view, map and navigation service alive for
+        // the life of the app.
+        self.eventChannel.setStreamHandler(WeakStreamHandler(self))
 
         self.channel.setMethodCallHandler { [weak self](call, result) in
 
@@ -118,6 +122,12 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
             else if(call.method == "setNightMode")
             {
                 strongSelf.setNightMode(arguments?["night"] as? Bool ?? false)
+                result(true)
+            }
+            else if(call.method == "setFasterRouteMinimumSaving")
+            {
+                strongSelf._fasterRouteMinimumSaving = arguments?["seconds"] as? Double ?? defaultFasterRouteMinimumSaving
+                strongSelf.emitNavState()
                 result(true)
             }
             else if(call.method == "setRouteLook")
@@ -361,14 +371,22 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         previous.view.removeFromSuperview()
         previous.removeFromParent()
         _navigationViewController = nil
-        navigationService = nil
+        releaseTripObjects()
     }
 
     deinit {
+        navTrace("view released")
         // Flutter let go of the view without a finishNavigation first.
         if let live = _navigationViewController {
             Self.finish(live.navigationService)
         }
+        eventChannel.setStreamHandler(nil)
+        channel.setMethodCallHandler(nil)
+    }
+
+    override func releaseTripObjects() {
+        super.releaseTripObjects()
+        navigationService = nil
     }
 
     func startEmbeddedNavigation(arguments: NSDictionary?, result: @escaping FlutterResult) {
@@ -620,4 +638,21 @@ extension FlutterMapboxNavigationView : UIGestureRecognizerDelegate {
         }
     }
 
+}
+
+/// Passes stream calls on to a handler it does not keep alive.
+final class WeakStreamHandler: NSObject, FlutterStreamHandler {
+    private weak var target: FlutterStreamHandler?
+
+    init(_ target: FlutterStreamHandler) {
+        self.target = target
+    }
+
+    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        return target?.onListen(withArguments: arguments, eventSink: events)
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        return target?.onCancel(withArguments: arguments)
+    }
 }
