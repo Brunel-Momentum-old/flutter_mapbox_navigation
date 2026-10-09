@@ -245,6 +245,8 @@ extension NavigationFactory {
         guard isEmbeddedNavigation, _eventSink != nil, !_navigatorBehind, let progress = _lastProgress else { return }
         showFasterRouteOnMap(!_offRoute && !_rerouting ? fasterAlternative() : nil)
         tagNextTurn(progress)
+        markDestination(progress)
+        closeInOnTurn(progress)
         guard let data = try? JSONSerialization.data(withJSONObject: navState(for: progress), options: []),
               let json = String(data: data, encoding: .utf8) else { return }
         sendEvent(eventType: MapBoxEventType.nav_state, data: json)

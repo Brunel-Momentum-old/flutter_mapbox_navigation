@@ -20,6 +20,11 @@ enum HostMapColor {
     static let ink = UIColor(red: 0x2B / 255.0, green: 0x2B / 255.0, blue: 0x2B / 255.0, alpha: 1)
     static let leftRoute = UIColor(red: 0x8E / 255.0, green: 0x8B / 255.0, blue: 0x83 / 255.0, alpha: 1)
     static let tip = UIColor(red: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1C / 255.0, alpha: 1)
+
+    /// As close as the following camera comes at a turn. The camera is
+    /// tilted, so it sees a long way ahead for its zoom: at the SDK's own
+    /// limit (16.35) a junction 30 m off was a few points across.
+    static let closestZoom = 18.75
     static let tipGreen = UIColor(red: 0x1F / 255.0, green: 0x5A / 255.0, blue: 0x37 / 255.0, alpha: 1)
 
     /// Route line, casing, traffic and puck colours, applied through the
@@ -88,6 +93,13 @@ extension NavigationFactory {
             if let viewport = map.navigationCamera.viewportDataSource as? NavigationViewportDataSource {
                 viewport.options.followingCameraOptions.bearingSmoothing.enabled = false
                 viewport.options.followingCameraOptions.pitchNearManeuver.enabled = false
+                // The camera closes in as a turn comes up, but the SDK
+                // stops it at a zoom where the screen still shows 600 m:
+                // 30 m from a junction the lanes and the turn itself were
+                // a few points across. Let it come in to where the
+                // junction fills the screen.
+                let zoom = viewport.options.followingCameraOptions.zoomRange
+                viewport.options.followingCameraOptions.zoomRange = zoom.lowerBound...HostMapColor.closestZoom
             }
             // The host offers a faster route in its own card; the SDK's
             // "2 min slower" bubbles on every alternative are noise.
@@ -117,6 +129,7 @@ extension NavigationFactory {
         // on the map makes the next tick draw it again.
         _fasterRouteOnMap = nil
         _shownTags = ""
+        _shownDestinationPin = nil
     }
 
     // MARK: Tags on the map: the next turn, and a faster route
@@ -133,6 +146,136 @@ extension NavigationFactory {
             _turnTag = nil
         }
         refreshTags()
+    }
+
+    // MARK: Closing in on a turn
+
+    /// Holds the following camera close as a turn comes up.
+    ///
+    /// The SDK works the zoom out from how much road is left before the
+    /// turn, and it does come in, but not reliably: a short street, or a
+    /// run of junctions, and it was still showing several blocks with the
+    /// turn 30 m away. So the least zoom it may use is raised as the
+    /// turn nears, from the SDK's own closest at 200 m to nearly the
+    /// closest allowed (`HostMapColor.closestZoom`) inside 60 m. On a
+    /// fast road the turn arrives sooner, so both distances are at least
+    /// a few seconds of driving: at 100 km/h it starts 330 m out and is
+    /// fully in by 110 m. Arriving is not a turn; the door view frames
+    /// that.
+    func closeInOnTurn(_ progress: RouteProgress) {
+        guard let viewport = _navigationViewController?.navigationMapView?.navigationCamera
+            .viewportDataSource as? NavigationViewportDataSource else { return }
+        let far = 10.5, sdkClosest = 16.35, near = HostMapColor.closestZoom - 0.25
+        var least = far
+        if let step = progress.currentLegProgress.upcomingStep, step.maneuverType != .arrive {
+            let distance = progress.currentLegProgress.currentStepProgress.distanceRemaining
+            let speed = max(0, _lastKnownLocation?.speed ?? 0)
+            let begin = max(200, speed * 12)
+            let closest = max(60, speed * 4)
+            if distance <= closest {
+                least = near
+            } else if distance <= begin {
+                least = sdkClosest + (begin - distance) / (begin - closest) * (near - sdkClosest)
+            }
+        }
+        let range = viewport.options.followingCameraOptions.zoomRange
+        guard abs(range.lowerBound - least) > 0.05 || range.upperBound != HostMapColor.closestZoom else { return }
+        viewport.options.followingCameraOptions.zoomRange = least...HostMapColor.closestZoom
+    }
+
+    // MARK: Where the stop is, at the end of the route
+
+    /// Marks the end of the route with a pin whose arrow points at the
+    /// stop. The route ends on the road; the stop is a house or a door
+    /// to one side of it, and which side is the first thing the driver
+    /// needs to know as they pull up.
+    ///
+    /// Shown on the last stretch and in the door view, not in the
+    /// overview, which has the numbered pins.
+    func markDestination(_ progress: RouteProgress) {
+        guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
+        let leg = progress.currentLeg
+        let arriving = progress.currentLegProgress.upcomingStep?.maneuverType == .arrive || _doorView != nil
+        var pin: (CLLocationCoordinate2D, CLLocationDirection?)?
+        if arriving, _cameraState != "overview", let last = leg.steps.last {
+            let road = last.maneuverLocation
+            pin = (road, Self.direction(toStopFrom: road, step: last,
+                                        stop: _doorView?.coordinate ?? leg.destination?.coordinate))
+        }
+        let key = pin.map { "\($0.0.latitude),\($0.0.longitude),\($0.1.map { String(Int($0.rounded())) } ?? "-")" } ?? ""
+        guard key != _shownDestinationPin else { return }
+        _shownDestinationPin = key
+        if _destinationPinManager == nil {
+            let manager = mapView.annotations.makePointAnnotationManager(id: "host-destination-pin")
+            // The arrow is a direction on the ground: it turns with the
+            // map, and nothing may hide it.
+            manager.iconRotationAlignment = .map
+            manager.iconAllowOverlap = true
+            manager.iconIgnorePlacement = true
+            _destinationPinManager = manager
+        }
+        guard let (road, direction) = pin else {
+            _destinationPinManager?.annotations = []
+            return
+        }
+        var annotation = PointAnnotation(coordinate: road)
+        annotation.image = .init(image: Self.destinationPinImage(pointing: direction != nil),
+                                 name: direction != nil ? "host-destination-arrow" : "host-destination-dot")
+        annotation.iconRotate = direction ?? 0
+        _destinationPinManager?.annotations = [annotation]
+    }
+
+    /// Which way the stop lies from the end of the route, as a compass
+    /// bearing. From the two points when they are far enough apart to
+    /// tell; otherwise from the side the directions give for the arrival.
+    /// Nil when neither says.
+    static func direction(toStopFrom road: CLLocationCoordinate2D,
+                          step: RouteStep,
+                          stop: CLLocationCoordinate2D?) -> CLLocationDirection? {
+        if let stop = stop,
+           CLLocation(latitude: road.latitude, longitude: road.longitude)
+            .distance(from: CLLocation(latitude: stop.latitude, longitude: stop.longitude)) >= 4 {
+            return road.direction(to: stop)
+        }
+        guard let heading = step.initialHeading ?? step.finalHeading else { return nil }
+        switch step.maneuverDirection {
+        case .left?, .slightLeft?, .sharpLeft?: return (heading + 270).truncatingRemainder(dividingBy: 360)
+        case .right?, .slightRight?, .sharpRight?: return (heading + 90).truncatingRemainder(dividingBy: 360)
+        default: return nil
+        }
+    }
+
+    /// A dark disc with a white ring; `pointing` adds a white arrow that
+    /// points up, to be turned towards the stop.
+    static func destinationPinImage(pointing: Bool) -> UIImage {
+        let diameter: CGFloat = 40
+        let size = CGSize(width: diameter + 4, height: diameter + 4)
+        return UIGraphicsImageRenderer(size: size).image { context in
+            let cg = context.cgContext
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+            let disc = CGRect(x: center.x - diameter / 2, y: center.y - diameter / 2, width: diameter, height: diameter)
+            cg.setFillColor(HostMapColor.tip.cgColor)
+            cg.fillEllipse(in: disc)
+            cg.setStrokeColor(UIColor.white.cgColor)
+            cg.setLineWidth(3)
+            cg.strokeEllipse(in: disc.insetBy(dx: 1.5, dy: 1.5))
+            cg.setFillColor(UIColor.white.cgColor)
+            guard pointing else {
+                cg.fillEllipse(in: CGRect(x: center.x - 5, y: center.y - 5, width: 10, height: 10))
+                return
+            }
+            // A head and a shaft, tip at the top.
+            let arrow = UIBezierPath()
+            arrow.move(to: CGPoint(x: center.x, y: center.y - 13))
+            arrow.addLine(to: CGPoint(x: center.x + 10, y: center.y - 1))
+            arrow.addLine(to: CGPoint(x: center.x + 3.5, y: center.y - 1))
+            arrow.addLine(to: CGPoint(x: center.x + 3.5, y: center.y + 12))
+            arrow.addLine(to: CGPoint(x: center.x - 3.5, y: center.y + 12))
+            arrow.addLine(to: CGPoint(x: center.x - 3.5, y: center.y - 1))
+            arrow.addLine(to: CGPoint(x: center.x - 10, y: center.y - 1))
+            arrow.close()
+            arrow.fill()
+        }
     }
 
     /// Draws the faster route on offer, or takes it off when the offer
@@ -348,8 +491,9 @@ extension NavigationFactory {
     /// screen, and stay out of the way while following.
     func refreshStopPins() {
         // Whatever changed the pins (the camera, the door view) changes
-        // which tags belong on the map too.
+        // which tags belong on the map too, and the pin at the stop.
         refreshTags()
+        if let progress = _lastProgress { markDestination(progress) }
         guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
         if _stopPinManager == nil {
             _stopPinManager = mapView.annotations.makePointAnnotationManager(id: "host-stop-pins")

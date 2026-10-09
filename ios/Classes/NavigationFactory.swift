@@ -95,6 +95,8 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _doorPointManager: PointAnnotationManager?
     var _doorPolygonManager: PolygonAnnotationManager?
     var _tagManager: PointAnnotationManager?
+    var _destinationPinManager: PointAnnotationManager?
+    var _shownDestinationPin: String?
     var _turnTag: (CLLocationCoordinate2D, String)?
     var _fasterTips: [(CLLocationCoordinate2D, String)] = []
     var _shownTags = ""
@@ -396,6 +398,8 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _doorPolygonManager = nil
         _tagManager = nil
         _shownTags = ""
+        _destinationPinManager = nil
+        _shownDestinationPin = nil
         _turnTag = nil
         _fasterTips = []
         _fasterRouteOnMap = nil
