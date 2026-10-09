@@ -21,6 +21,7 @@ import com.eopeter.fluttermapboxnavigation.utilities.PluginUtilities
 import com.eopeter.fluttermapboxnavigation.utilities.PluginUtilities.Companion.sendEvent
 import com.google.gson.Gson
 import com.mapbox.api.directions.v5.models.DirectionsRoute
+import com.mapbox.api.directions.v5.DirectionsCriteria
 import com.mapbox.api.directions.v5.models.RouteOptions
 import com.mapbox.geojson.Point
 import com.mapbox.maps.MapView
@@ -84,7 +85,7 @@ class NavigationActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setTheme(R.style.Theme_AppCompat_NoActionBar)
+        setTheme(androidx.appcompat.R.style.Theme_AppCompat_NoActionBar)
         binding = NavigationActivityBinding.inflate(layoutInflater)
         setContentView(binding.root)
         binding.navigationView.addListener(navigationStateListener)
@@ -226,6 +227,7 @@ class NavigationActivity : AppCompatActivity() {
                 .bannerInstructions(FlutterMapboxNavigationPlugin.bannerInstructionsEnabled)
                 .voiceInstructions(FlutterMapboxNavigationPlugin.voiceInstructionsEnabled)
                 .steps(true)
+                .exclude(DirectionsCriteria.EXCLUDE_TOLL)
                 .build(),
             callback = object : NavigationRouterCallback {
                 override fun onCanceled(routeOptions: RouteOptions, routerOrigin: RouterOrigin) {
@@ -291,6 +293,7 @@ class NavigationActivity : AppCompatActivity() {
                 .waypointIndicesList(addedWaypoints.waypointsIndices())
                 .waypointNamesList(addedWaypoints.waypointsNames())
                 .alternatives(true)
+                .exclude(DirectionsCriteria.EXCLUDE_TOLL)
                 .build(),
             callback = object : NavigationRouterCallback {
                 override fun onRoutesReady(

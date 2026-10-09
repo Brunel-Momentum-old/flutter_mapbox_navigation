@@ -20,5 +20,11 @@ enum MapBoxEvent {
   on_arrival,
   failed_to_reroute,
   reroute_along,
-  on_map_tap
+  on_map_tap,
+
+  /// Per-tick guidance state for a custom UI. Data is a [NavState].
+  nav_state,
+
+  /// The map camera changed mode. Data is a [NavCameraState].
+  camera_state,
 }

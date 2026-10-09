@@ -1,6 +1,7 @@
 export 'event_data.dart';
 export 'events.dart';
 export 'feedback.dart';
+export 'nav_state.dart';
 export 'navmode.dart';
 export 'options.dart';
 export 'route_event.dart';

@@ -47,7 +47,7 @@ class PluginUtilities {
             // Always emit valid JSON: raw-JSON events with no payload used to
             // produce `"data": }` (USER_OFF_ROUTE sends none), and string
             // payloads were not escaped (a quote in an instruction broke it).
-            val isRawJson = MapBoxEvents.MILESTONE_EVENT == event || event == MapBoxEvents.USER_OFF_ROUTE || event == MapBoxEvents.ROUTE_BUILT || event == MapBoxEvents.ON_MAP_TAP
+            val isRawJson = MapBoxEvents.MILESTONE_EVENT == event || event == MapBoxEvents.USER_OFF_ROUTE || event == MapBoxEvents.ROUTE_BUILT || event == MapBoxEvents.ON_MAP_TAP || event == MapBoxEvents.NAV_STATE
             val dataJson = if (isRawJson) data.ifBlank { "{}" } else JSONObject.quote(data)
             val jsonString = "{" +
                     "  \"eventType\": \"${event.value}\"," +

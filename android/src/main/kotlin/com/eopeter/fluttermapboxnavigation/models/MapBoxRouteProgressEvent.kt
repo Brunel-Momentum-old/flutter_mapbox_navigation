@@ -41,6 +41,8 @@ class MapBoxRouteProgressEvent(progress: RouteProgress) {
 
     private fun toJsonObject(): JsonObject {
         val json = JsonObject()
+        // The Dart side recognises a progress sample by this key.
+        json.addProperty("arrived", arrived ?: false)
         addProperty(json, "distance", distance)
         addProperty(json, "duration", duration)
         addProperty(json, "distanceTraveled", distanceTraveled)

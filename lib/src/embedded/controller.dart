@@ -143,6 +143,41 @@ class MapBoxNavigationViewController {
     return success as bool?;
   }
 
+  /// Silences or restores spoken instructions.
+  Future<void> setMuted({required bool muted}) =>
+      _methodChannel.invokeMethod<void>('setMuted', {'muted': muted});
+
+  /// Moves the camera to show the whole remaining route.
+  Future<void> showOverview() =>
+      _methodChannel.invokeMethod<void>('showOverview');
+
+  /// Returns the camera to following the driver.
+  Future<void> recenter() => _methodChannel.invokeMethod<void>('recenter');
+
+  /// Tells the map how much of it is covered by the host's own UI, in
+  /// logical pixels, so the driver's position sits in the clear area.
+  Future<void> setCameraPadding({
+    required double top,
+    required double bottom,
+    double left = 0,
+    double right = 0,
+  }) =>
+      _methodChannel.invokeMethod<void>('setCameraPadding', {
+        'top': top,
+        'bottom': bottom,
+        'left': left,
+        'right': right,
+      });
+
+  /// Switches to the faster route on offer in [NavState.fasterRoute].
+  /// Completes with false when there is none.
+  Future<bool> acceptFasterRoute() async =>
+      await _methodChannel.invokeMethod<bool>('acceptFasterRoute') ?? false;
+
+  /// Dismisses the faster route on offer and keeps the current one.
+  Future<void> declineFasterRoute() =>
+      _methodChannel.invokeMethod<void>('declineFasterRoute');
+
   /// Generic Handler for Messages sent from the Platform
   Future<dynamic> _handleMethod(MethodCall call) async {
     switch (call.method) {

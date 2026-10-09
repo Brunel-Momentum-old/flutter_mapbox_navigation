@@ -90,6 +90,7 @@ public class RouteOptionsViewController : UIViewController, NavigationMapViewDel
 
         // Specify that the route is intended for automobiles avoiding traffic
         let routeOptions = NavigationRouteOptions(waypoints: [origin, destination], profileIdentifier: .automobileAvoidingTraffic)
+        routeOptions.roadClassesToAvoid = .toll
 
         // Generate the route object and draw it on the map
         _ = Directions.shared.calculate(routeOptions) { [weak self] (session, result) in

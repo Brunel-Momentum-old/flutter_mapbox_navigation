@@ -16,6 +16,16 @@ import com.eopeter.fluttermapboxnavigation.models.WaypointSet
 import com.eopeter.fluttermapboxnavigation.utilities.CustomInfoPanelEndNavButtonBinder
 import com.eopeter.fluttermapboxnavigation.utilities.PluginUtilities
 import com.google.gson.Gson
+import com.mapbox.maps.EdgeInsets
+import com.mapbox.navigation.core.reroute.RerouteController
+import com.mapbox.navigation.core.reroute.RerouteState
+import com.mapbox.navigation.dropin.navigationview.NavigationViewListener
+import com.mapbox.navigation.ui.app.internal.SharedApp
+import com.mapbox.navigation.ui.app.internal.audioguidance.AudioAction
+import com.mapbox.navigation.ui.app.internal.camera.CameraAction
+import com.mapbox.navigation.ui.app.internal.camera.TargetCameraMode
+import org.json.JSONArray
+import org.json.JSONObject
 import com.mapbox.maps.Style
 import com.mapbox.api.directions.v5.DirectionsCriteria
 import com.mapbox.api.directions.v5.models.RouteOptions
@@ -37,6 +47,9 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
+
+/** How much faster an alternative has to be before it is offered. */
+private const val FASTER_ROUTE_MIN_SAVING_S = 120.0
 
 open class TurnByTurn(
     ctx: Context,
@@ -97,12 +110,49 @@ open class TurnByTurn(
             "getDurationRemaining" -> {
                 result.success(this.durationRemaining)
             }
+            "setMuted" -> {
+                val muted = methodCall.argument<Boolean>("muted") ?: false
+                SharedApp.store.dispatch(if (muted) AudioAction.Mute else AudioAction.Unmute)
+                result.success(true)
+            }
+            "showOverview" -> {
+                SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Overview))
+                result.success(true)
+            }
+            "recenter", "reCenter" -> {
+                SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
+                result.success(true)
+            }
+            "setCameraPadding" -> {
+                val density = this.context.resources.displayMetrics.density.toDouble()
+                this.hostPadding = EdgeInsets(
+                    (methodCall.argument<Double>("top") ?: 0.0) * density,
+                    (methodCall.argument<Double>("left") ?: 0.0) * density,
+                    (methodCall.argument<Double>("bottom") ?: 0.0) * density,
+                    (methodCall.argument<Double>("right") ?: 0.0) * density,
+                )
+                this.applyHostPadding()
+                result.success(true)
+            }
+            "acceptFasterRoute" -> {
+                result.success(this.acceptFasterRoute())
+            }
+            "declineFasterRoute" -> {
+                this.fasterAlternative()?.let { this.declinedAlternativeIds.add(it.id) }
+                this.emitNavState()
+                result.success(true)
+            }
             else -> result.notImplemented()
         }
     }
 
     private fun buildRoute(methodCall: MethodCall, result: MethodChannel.Result) {
         this.isNavigationCanceled = false
+        this.offRoute = false
+        this.rerouting = false
+        this.arrived = false
+        this.lastProgress = null
+        this.declinedAlternativeIds.clear()
 
         val arguments = methodCall.arguments as? Map<*, *>
         if (arguments != null) this.setOptions(arguments)
@@ -146,6 +196,7 @@ open class TurnByTurn(
                 .voiceUnits(navigationVoiceUnits)
                 .bannerInstructions(bannerInstructionsEnabled)
                 .voiceInstructions(voiceInstructionsEnabled)
+                .exclude(DirectionsCriteria.EXCLUDE_TOLL)
                 .build(),
             callback = object : NavigationRouterCallback {
                 override fun onRoutesReady(
@@ -343,6 +394,9 @@ open class TurnByTurn(
         MapboxNavigationApp.current()?.registerLocationObserver(this.locationObserver)
         MapboxNavigationApp.current()?.registerRouteProgressObserver(this.routeProgressObserver)
         MapboxNavigationApp.current()?.registerArrivalObserver(this.arrivalObserver)
+        MapboxNavigationApp.current()?.getRerouteController()
+            ?.registerRerouteStateObserver(this.rerouteStateObserver)
+        this.binding.navigationView.addListener(this.cameraListener)
     }
 
     open fun unregisterObservers() {
@@ -354,6 +408,9 @@ open class TurnByTurn(
         MapboxNavigationApp.current()?.unregisterLocationObserver(this.locationObserver)
         MapboxNavigationApp.current()?.unregisterRouteProgressObserver(this.routeProgressObserver)
         MapboxNavigationApp.current()?.unregisterArrivalObserver(this.arrivalObserver)
+        MapboxNavigationApp.current()?.getRerouteController()
+            ?.unregisterRerouteStateObserver(this.rerouteStateObserver)
+        this.binding.navigationView.removeListener(this.cameraListener)
     }
 
     // Flutter stream listener delegate methods
@@ -408,6 +465,18 @@ open class TurnByTurn(
     private var currentRoutes: List<NavigationRoute>? = null
     private var isNavigationCanceled = false
 
+    // State behind the nav_state event.
+    private var lastProgress: RouteProgress? = null
+    private var activeRoutes: List<NavigationRoute> = emptyList()
+    private var offRoute = false
+    private var rerouting = false
+    private var arrived = false
+    private var speedLimitKmph: Int? = null
+    private var cameraState: String? = null
+    private var hostPadding: EdgeInsets? = null
+    private val declinedAlternativeIds = mutableSetOf<String>()
+    private var fasterRouteSaving: Double? = null
+
     /**
      * Bindings to the example layout.
      */
@@ -422,6 +491,7 @@ open class TurnByTurn(
     private val locationObserver = object : LocationObserver {
         override fun onNewLocationMatcherResult(locationMatcherResult: LocationMatcherResult) {
             this@TurnByTurn.lastLocation = locationMatcherResult.enhancedLocation
+            this@TurnByTurn.speedLimitKmph = locationMatcherResult.speedLimit?.speedKmph
         }
 
         override fun onNewRawLocation(rawLocation: Location) {
@@ -438,14 +508,168 @@ open class TurnByTurn(
     }
 
     private val offRouteObserver = OffRouteObserver { offRoute ->
+        this.offRoute = offRoute
         if (offRoute) {
             PluginUtilities.sendEvent(MapBoxEvents.USER_OFF_ROUTE)
         }
+        this.emitNavState()
     }
 
     private val routesObserver = RoutesObserver { routeUpdateResult ->
+        this.activeRoutes = routeUpdateResult.navigationRoutes
         if (routeUpdateResult.navigationRoutes.isNotEmpty()) {
             PluginUtilities.sendEvent(MapBoxEvents.REROUTE_ALONG);
+        }
+        if (this.fasterAlternative() != null) {
+            PluginUtilities.sendEvent(MapBoxEvents.FASTER_ROUTE_FOUND)
+        }
+        this.emitNavState()
+    }
+
+    private val rerouteStateObserver = RerouteController.RerouteStateObserver { state ->
+        this.rerouting = state is RerouteState.FetchingRoute
+        if (state is RerouteState.Failed) {
+            PluginUtilities.sendEvent(MapBoxEvents.FAILED_TO_REROUTE, state.message)
+        }
+        this.emitNavState()
+    }
+
+    /**
+     * Reports the Drop-In camera mode to the host, and puts the host's
+     * padding back whenever Drop-In recomputes its own.
+     */
+    private val cameraListener = object : NavigationViewListener() {
+        override fun onFollowingCameraMode() = sendCameraState("following")
+        override fun onOverviewCameraMode() = sendCameraState("overview")
+        override fun onIdleCameraMode() = sendCameraState("free")
+        override fun onCameraPaddingChanged(padding: EdgeInsets) {
+            val wanted = this@TurnByTurn.hostPadding ?: return
+            if (padding != wanted) this@TurnByTurn.applyHostPadding()
+        }
+    }
+
+    private fun sendCameraState(state: String) {
+        if (state == this.cameraState) return
+        this.cameraState = state
+        PluginUtilities.sendEvent(MapBoxEvents.CAMERA_STATE, state)
+    }
+
+    private fun applyHostPadding() {
+        val padding = this.hostPadding ?: return
+        SharedApp.store.dispatch(CameraAction.UpdatePadding(padding))
+    }
+
+    /** The alternative worth offering right now, if any. */
+    private fun fasterAlternative(): NavigationRoute? {
+        val navigation = MapboxNavigationApp.current() ?: return null
+        val routes = this.activeRoutes
+        if (routes.size < 2) return null
+        val primaryDuration = routes.first().directionsRoute.duration()
+        var best: NavigationRoute? = null
+        var bestSaving = FASTER_ROUTE_MIN_SAVING_S
+        for (route in routes.drop(1)) {
+            if (this.declinedAlternativeIds.contains(route.id)) continue
+            val metadata = navigation.getAlternativeMetadataFor(route) ?: continue
+            val saving = primaryDuration - metadata.infoFromStartOfPrimary.duration
+            if (saving >= bestSaving) {
+                best = route
+                bestSaving = saving
+            }
+        }
+        this.fasterRouteSaving = if (best == null) null else bestSaving
+        return best
+    }
+
+    private fun acceptFasterRoute(): Boolean {
+        val navigation = MapboxNavigationApp.current() ?: return false
+        val alternative = this.fasterAlternative() ?: return false
+        navigation.setNavigationRoutes(
+            listOf(alternative) + this.activeRoutes.filter { it.id != alternative.id }
+        )
+        return true
+    }
+
+    /**
+     * Sends the latest guidance state to the host: everything a custom
+     * turn-by-turn UI needs, in one event.
+     */
+    private fun emitNavState() {
+        if (this.isNavigationCanceled) return
+        val progress = this.lastProgress ?: return
+        try {
+            val state = JSONObject()
+            state.put("distanceRemaining", progress.distanceRemaining.toDouble())
+            state.put("durationRemaining", progress.durationRemaining)
+            state.put(
+                "etaEpochMs",
+                System.currentTimeMillis() + (progress.durationRemaining * 1000).toLong()
+            )
+            state.put("offRoute", this.offRoute)
+            state.put("rerouting", this.rerouting)
+            state.put("arrived", this.arrived)
+
+            progress.currentLegProgress?.currentStepProgress?.let {
+                state.put("distanceToManeuver", it.distanceRemaining.toDouble())
+            }
+
+            val banner = progress.bannerInstructions
+            if (banner != null) {
+                val maneuver = JSONObject()
+                banner.primary().type()?.let { maneuver.put("type", it) }
+                banner.primary().modifier()?.let { maneuver.put("modifier", it) }
+                maneuver.put("text", banner.primary().text())
+                banner.secondary()?.text()?.takeIf { it.isNotEmpty() }
+                    ?.let { maneuver.put("secondaryText", it) }
+                state.put("maneuver", maneuver)
+
+                val sub = banner.sub()
+                if (sub != null) {
+                    val lanes = JSONArray()
+                    for (component in sub.components() ?: emptyList()) {
+                        if (component.type() != "lane") continue
+                        val lane = JSONObject()
+                        lane.put("indications", JSONArray(component.directions() ?: emptyList<String>()))
+                        lane.put("valid", component.active() ?: false)
+                        component.activeDirection()?.let { lane.put("active", it) }
+                        lanes.put(lane)
+                    }
+                    if (lanes.length() > 0) {
+                        state.put("lanes", lanes)
+                    } else {
+                        val then = JSONObject()
+                        sub.type()?.let { then.put("type", it) }
+                        sub.modifier()?.let { then.put("modifier", it) }
+                        then.put("text", sub.text())
+                        state.put("then", then)
+                    }
+                }
+            }
+
+            this.speedLimitKmph?.let { kmph ->
+                val metric = this.navigationVoiceUnits != DirectionsCriteria.IMPERIAL
+                state.put(
+                    "speedLimit",
+                    if (metric) kmph else Math.round(kmph / 1.609344 / 5.0).toInt() * 5
+                )
+                state.put("speedLimitUnit", if (metric) "km/h" else "mph")
+            }
+
+            this.lastLocation?.let {
+                state.put("latitude", it.latitude)
+                state.put("longitude", it.longitude)
+                if (it.hasBearing()) state.put("bearing", it.bearing.toDouble())
+                if (it.hasSpeed()) state.put("speed", it.speed.toDouble())
+            }
+
+            if (!this.offRoute && !this.rerouting && this.fasterAlternative() != null) {
+                this.fasterRouteSaving?.let {
+                    state.put("fasterRoute", JSONObject().put("savingSeconds", it))
+                }
+            }
+
+            PluginUtilities.sendEvent(MapBoxEvents.NAV_STATE, state.toString())
+        } catch (_: java.lang.Exception) {
+            // A state that fails to encode is skipped, never fatal.
         }
     }
 
@@ -462,6 +686,8 @@ open class TurnByTurn(
 
                 val progressEvent = MapBoxRouteProgressEvent(routeProgress)
                 PluginUtilities.sendEvent(progressEvent)
+                this.lastProgress = routeProgress
+                this.emitNavState()
             } catch (_: java.lang.Exception) {
                 // handle this error
             }
@@ -470,7 +696,9 @@ open class TurnByTurn(
 
     private val arrivalObserver: ArrivalObserver = object : ArrivalObserver {
         override fun onFinalDestinationArrival(routeProgress: RouteProgress) {
+            this@TurnByTurn.arrived = true
             PluginUtilities.sendEvent(MapBoxEvents.ON_ARRIVAL)
+            this@TurnByTurn.emitNavState()
         }
 
         override fun onNextRouteLegStart(routeLegProgress: RouteLegProgress) {

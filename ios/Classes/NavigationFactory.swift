@@ -57,7 +57,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _allowsUTurnAtWayPoints: Bool?
     var _isOptimized = false
     var _language = "en"
-    var _voiceUnits = "imperial"
+    var _voiceUnits = "metric"
     var _mapStyleUrlDay: String?
     var _mapStyleUrlNight: String?
     var _zoom: Double = 13.0
@@ -71,6 +71,19 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _showEndOfRouteFeedback = true
     var _enableOnMapTapCallback = false
     var navigationDirections: Directions?
+
+    // Headless embedded navigation — see HeadlessNavigation.swift.
+    var _topSpacer: SpacerBannerViewController?
+    var _bottomSpacer: SpacerBannerViewController?
+    var _cameraPaddingTop: CGFloat = 0
+    var _cameraPaddingBottom: CGFloat = 0
+    var _cameraState: String?
+    var _overviewRequested = false
+    var _lastUserGestureAt: Date?
+    var _offRoute = false
+    var _rerouting = false
+    var _declinedAlternatives = Set<AlternativeRoute.ID>()
+    var _lastProgress: RouteProgress?
     
     func addWayPoints(arguments: NSDictionary?, result: @escaping FlutterResult)
     {
@@ -256,6 +269,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
             mode = .walking
         }
         let options = NavigationRouteOptions(waypoints: wayPoints, profileIdentifier: mode)
+        options.roadClassesToAvoid = .toll
         
         if (_allowsUTurnAtWayPoints != nil)
         {
@@ -480,11 +494,16 @@ extension NavigationFactory : NavigationViewControllerDelegate {
                 _eventSink?(progressEventJson)
             }
 
-            if(progress.isFinalLeg && progress.currentLegProgress.userHasArrivedAtWaypoint && !_showEndOfRouteFeedback)
+            // Full-screen sessions stop reporting at the destination. An
+            // embedded session keeps going: the host's own UI is still on
+            // screen and still needs the state.
+            if(!isEmbeddedNavigation && progress.isFinalLeg && progress.currentLegProgress.userHasArrivedAtWaypoint && !_showEndOfRouteFeedback)
             {
                 _eventSink = nil
             }
         }
+        _lastProgress = progress
+        emitNavState()
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didArriveAt waypoint: Waypoint) -> Bool {
@@ -509,7 +528,37 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, shouldRerouteFrom location: CLLocation) -> Bool {
+        if !_offRoute {
+            _offRoute = true
+            sendEvent(eventType: MapBoxEventType.user_off_route)
+            emitNavState()
+        }
         return _shouldReRoute
+    }
+
+    public func navigationViewController(_ navigationViewController: NavigationViewController, willRerouteFrom location: CLLocation?) {
+        _rerouting = true
+        emitNavState()
+    }
+
+    public func navigationViewController(_ navigationViewController: NavigationViewController, didRerouteAlong route: Route) {
+        _offRoute = false
+        _rerouting = false
+        sendEvent(eventType: MapBoxEventType.reroute_along)
+        emitNavState()
+    }
+
+    public func navigationViewController(_ navigationViewController: NavigationViewController, didFailToRerouteWith error: Error) {
+        _rerouting = false
+        sendEvent(eventType: MapBoxEventType.failed_to_reroute, data: error.localizedDescription)
+        emitNavState()
+    }
+
+    public func navigationViewController(_ navigationViewController: NavigationViewController, didUpdateAlternatives updatedAlternatives: [AlternativeRoute], removedAlternatives: [AlternativeRoute]) {
+        if fasterAlternative() != nil {
+            sendEvent(eventType: MapBoxEventType.faster_route_found)
+        }
+        emitNavState()
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didSubmitArrivalFeedback feedback: EndOfRouteFeedback) {

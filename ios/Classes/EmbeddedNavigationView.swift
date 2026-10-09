@@ -80,9 +80,38 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
             {
                 strongSelf.startEmbeddedNavigation(arguments: arguments, result: result)
             }
-            else if(call.method == "reCenter"){
-                //used to recenter map from user action during navigation
-                strongSelf.navigationMapView?.navigationCamera.follow()
+            else if(call.method == "reCenter" || call.method == "recenter"){
+                if strongSelf._navigationViewController != nil {
+                    strongSelf.recenter()
+                } else {
+                    strongSelf.navigationMapView?.navigationCamera.follow()
+                }
+                result(true)
+            }
+            else if(call.method == "showOverview")
+            {
+                strongSelf.showOverview()
+                result(true)
+            }
+            else if(call.method == "setMuted")
+            {
+                strongSelf.setMuted(arguments?["muted"] as? Bool ?? false)
+                result(true)
+            }
+            else if(call.method == "setCameraPadding")
+            {
+                strongSelf._cameraPaddingTop = CGFloat(arguments?["top"] as? Double ?? 0)
+                strongSelf._cameraPaddingBottom = CGFloat(arguments?["bottom"] as? Double ?? 0)
+                strongSelf.applyCameraPadding()
+                result(true)
+            }
+            else if(call.method == "acceptFasterRoute")
+            {
+                strongSelf.acceptFasterRoute(result: result)
+            }
+            else if(call.method == "declineFasterRoute")
+            {
+                strongSelf.declineFasterRoute()
                 result(true)
             }
             else
@@ -238,6 +267,7 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         }
 
         let routeOptions = NavigationRouteOptions(waypoints: _wayPoints, profileIdentifier: mode)
+        routeOptions.roadClassesToAvoid = .toll
 
         if (_allowsUTurnAtWayPoints != nil)
         {
@@ -350,14 +380,21 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         if(_mapStyleUrlNight != nil){
             nightStyle.mapStyleURL = URL(string: _mapStyleUrlNight!)!
         }
-        let navigationOptions = NavigationOptions(styles: [dayStyle, nightStyle], navigationService: navigationService)
+        // Headless: the host app draws every control. Two invisible
+        // banners stand in for Mapbox's, sized by `setCameraPadding`.
+        let topSpacer = SpacerBannerViewController()
+        let bottomSpacer = SpacerBannerViewController()
+        let navigationOptions = NavigationOptions(styles: [dayStyle, nightStyle],
+                                                  navigationService: navigationService,
+                                                  topBanner: topSpacer,
+                                                  bottomBanner: bottomSpacer)
 
         let navigationViewController = NavigationViewController(for: response, routeIndex: selectedRouteIndex, routeOptions: routeOptions, navigationOptions: navigationOptions)
         navigationViewController.delegate = self
 
-        navigationViewController.showsReportFeedback = _showReportFeedbackButton
-        navigationViewController.showsEndOfRouteFeedback = _showEndOfRouteFeedback
-
+        resetHeadlessState()
+        _topSpacer = topSpacer
+        _bottomSpacer = bottomSpacer
         _navigationViewController = navigationViewController
         hostViewController.addChild(navigationViewController)
 
@@ -365,6 +402,8 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         navigationViewController.view.translatesAutoresizingMaskIntoConstraints = false
         constraintsWithPaddingBetween(holderView: self.navigationMapView, topView: navigationViewController.view, padding: 0.0)
         navigationViewController.didMove(toParent: hostViewController)
+        makeHeadless(navigationViewController)
+        applyCameraPadding()
         result(true)
 
     }
@@ -444,10 +483,6 @@ extension FlutterMapboxNavigationView : NavigationServiceDelegate {
                 _eventSink?(progressEventJson)
             }
 
-            if(progress.isFinalLeg && progress.currentLegProgress.userHasArrivedAtWaypoint)
-            {
-                _eventSink = nil
-            }
         }
     }
 }
@@ -519,6 +554,7 @@ extension FlutterMapboxNavigationView : UIGestureRecognizerDelegate {
         let destinationWaypoint = Waypoint(coordinate: destination)
 
         let routeOptions = NavigationRouteOptions(waypoints: [userWaypoint, destinationWaypoint])
+        routeOptions.roadClassesToAvoid = .toll
 
         Directions.shared.calculate(routeOptions) { [weak self] (session, result) in
 

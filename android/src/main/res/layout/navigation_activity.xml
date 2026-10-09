@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-app:accessToken can be set to anything other than @string/... as we will
-read from @string/mapbox_access_token later
+app:accessToken must be @string/mapbox_access_token — Drop-In validates
+the attribute at inflate; a placeholder causes 401 / stuck gray map
  -->
 <com.mapbox.navigation.dropin.NavigationView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/navigationView"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    app:accessToken="this-can-be-skip-since-we-set-it-later"
+    app:accessToken="@string/mapbox_access_token"
     xmlns:app="http://schemas.android.com/apk/res-auto">
 </com.mapbox.navigation.dropin.NavigationView>
