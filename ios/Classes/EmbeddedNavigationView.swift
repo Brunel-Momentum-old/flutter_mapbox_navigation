@@ -120,6 +120,11 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
                 strongSelf.setNightMode(arguments?["night"] as? Bool ?? false)
                 result(true)
             }
+            else if(call.method == "setRouteLook")
+            {
+                strongSelf.setRouteLook(arguments?["look"] as? String ?? "normal")
+                result(true)
+            }
             else if(call.method == "acceptFasterRoute")
             {
                 strongSelf.acceptFasterRoute(result: result)

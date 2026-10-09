@@ -111,6 +111,7 @@ class NavState {
     this.bearing,
     this.speed,
     this.roadName,
+    this.fixAgeSeconds,
   });
 
   /// Accepts the event payload as a map (Android) or a JSON string (iOS).
@@ -167,6 +168,7 @@ class NavState {
       bearing: _num(json['bearing'])?.toDouble(),
       speed: _num(json['speed'])?.toDouble(),
       roadName: _string(json['roadName']),
+      fixAgeSeconds: _num(json['fixAgeSeconds'])?.toDouble(),
     );
   }
 
@@ -212,6 +214,27 @@ class NavState {
   /// Metres per second.
   final double? speed;
   final String? roadName;
+
+  /// Seconds since the phone last reported a position.
+  ///
+  /// The navigator keeps ticking when fixes stop, carrying on from the
+  /// last one, so a steady stream of states does not mean the driver's
+  /// position is known. This is how a host tells that GPS has gone.
+  final double? fixAgeSeconds;
+}
+
+/// How the route line is drawn. See
+/// `MapBoxNavigationViewController.setRouteLook`.
+enum NavRouteLook {
+  /// The route in its own colours.
+  normal,
+
+  /// Washed out: the position on it is only the last one known.
+  faded,
+
+  /// The driver has left it: grey and dashed until a new route replaces
+  /// it.
+  left,
 }
 
 /// A numbered pin for a stop, shown while the map is in overview.

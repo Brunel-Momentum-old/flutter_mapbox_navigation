@@ -287,6 +287,12 @@ extension NavigationFactory {
             if location.speed >= 0 { state["speed"] = location.speed }
         }
 
+        // The navigator keeps ticking when fixes stop, so the host needs
+        // to be told how old the last real one is.
+        if let at = _lastRawFixAt {
+            state["fixAgeSeconds"] = max(0, Date().timeIntervalSince(at))
+        }
+
         if !_offRoute, !_rerouting, let alternative = fasterAlternative() {
             state["fasterRoute"] = ["savingSeconds": -alternative.expectedTravelTimeDelta]
         }

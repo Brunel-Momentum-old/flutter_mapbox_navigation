@@ -84,6 +84,13 @@ void main() {
       expect(state.arrived, isFalse);
     });
 
+    test('the age of the last real fix comes through, and is null when '
+        'the platform does not send it', () {
+      expect(NavState.tryParse(full)!.fixAgeSeconds, isNull);
+      final stale = NavState.tryParse({...full, 'fixAgeSeconds': 17.5})!;
+      expect(stale.fixAgeSeconds, 17.5);
+    });
+
     test('wrong scalar types are ignored, not thrown', () {
       final state = NavState.tryParse(const <String, dynamic>{
         'maneuver': 'turn right',

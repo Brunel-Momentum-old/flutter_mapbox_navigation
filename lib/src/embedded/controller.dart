@@ -200,6 +200,12 @@ class MapBoxNavigationViewController {
   Future<void> setNightMode({required bool night}) =>
       _methodChannel.invokeMethod<void>('setNightMode', {'night': night});
 
+  /// Draws the route as [look]: in its own colours, washed out while
+  /// the driver's position is only the last one known, or grey and
+  /// dashed once they have left it.
+  Future<void> setRouteLook(NavRouteLook look) =>
+      _methodChannel.invokeMethod<void>('setRouteLook', {'look': look.name});
+
   /// Switches to the faster route on offer in [NavState.fasterRoute].
   /// Completes with false when there is none.
   Future<bool> acceptFasterRoute() async =>

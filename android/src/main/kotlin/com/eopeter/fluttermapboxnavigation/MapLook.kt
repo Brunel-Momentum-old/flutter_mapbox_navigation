@@ -11,14 +11,21 @@ import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.location.Location
 import android.view.Gravity
+import com.mapbox.geojson.LineString
 import com.mapbox.geojson.Point
 import com.mapbox.maps.CameraOptions
 import com.mapbox.maps.EdgeInsets
+import com.mapbox.bindgen.Value
 import com.mapbox.maps.MapView
 import com.mapbox.maps.Style
 import com.mapbox.maps.plugin.delegates.listeners.OnStyleLoadedListener
 import com.mapbox.maps.extension.style.expressions.dsl.generated.get
 import com.mapbox.maps.extension.style.layers.addLayer
+import com.mapbox.maps.extension.style.layers.addLayerBelow
+import com.mapbox.maps.extension.style.layers.generated.lineLayer
+import com.mapbox.maps.extension.style.layers.properties.generated.LineCap
+import com.mapbox.maps.extension.style.sources.addSource
+import com.mapbox.maps.extension.style.sources.generated.geoJsonSource
 import com.mapbox.maps.extension.style.layers.generated.symbolLayer
 import com.mapbox.maps.plugin.LocationPuck2D
 import com.mapbox.maps.plugin.animation.MapAnimationOptions
@@ -64,6 +71,11 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val GREEN = Color.parseColor("#2B7348")
         val BUILDING_FILL = Color.parseColor("#BFDCCB")
         val INK = Color.parseColor("#2B2B2B")
+        val LEFT_ROUTE = Color.parseColor("#8E8B83")
+        private const val LEFT_ROUTE_ID = "host-left-route"
+
+        // Every layer the SDK draws a route with starts with this.
+        private const val ROUTE_LAYER_PREFIX = "mapbox-layerGroup-"
         private const val HOUSE_NUMBER_LAYER = "host-house-numbers"
 
         /** Clear of the host's Sound and Route buttons on the right. */
@@ -175,6 +187,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }
         // A new style drops the layers this class added.
         if (doorEnabled) addHouseNumbers()
+        if (routeLook != "normal") applyRouteLook(style)
     }
 
     fun onMapAttached(view: MapView) {
@@ -217,6 +230,51 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         pinManager = null
         doorPointManager = null
         doorPolygonManager = null
+    }
+
+    // ---- route look ---------------------------------------------------
+
+    private var routeLook = "normal"
+    private var leftRoute: LineString? = null
+
+    /**
+     * "normal", "faded" or "left" (see `NavRouteLook` on the Dart side).
+     * [ahead] is the part of the old route still ahead of the driver, for
+     * "left".
+     */
+    fun setRouteLook(look: String, ahead: LineString?) {
+        if (look == routeLook) return
+        routeLook = look
+        leftRoute = ahead
+        mapView?.getMapboxMap()?.getStyle { applyRouteLook(it) }
+    }
+
+    private fun applyRouteLook(style: Style) {
+        val opacity = when (routeLook) {
+            "faded" -> 0.55
+            "left" -> 0.0
+            else -> 1.0
+        }
+        // The SDK keeps its route layers and redraws into them, so an
+        // opacity set here stays until it is set back.
+        for (layer in style.styleLayers) {
+            if (layer.id.startsWith(ROUTE_LAYER_PREFIX)) {
+                style.setStyleLayerProperty(layer.id, "line-opacity", Value(opacity))
+            }
+        }
+        if (style.styleLayerExists(LEFT_ROUTE_ID)) style.removeStyleLayer(LEFT_ROUTE_ID)
+        if (style.styleSourceExists(LEFT_ROUTE_ID)) style.removeStyleSource(LEFT_ROUTE_ID)
+        val ahead = leftRoute
+        if (routeLook != "left" || ahead == null) return
+        style.addSource(geoJsonSource(LEFT_ROUTE_ID) { geometry(ahead) })
+        val layer = lineLayer(LEFT_ROUTE_ID, LEFT_ROUTE_ID) {
+            lineColor(LEFT_ROUTE)
+            lineWidth(8.0)
+            lineCap(LineCap.ROUND)
+            lineDasharray(listOf(0.5, 1.5))
+        }
+        val anchor = ROUTE_LINE_ANCHORS.firstOrNull { style.styleLayerExists(it) }
+        if (anchor != null) style.addLayerBelow(layer, anchor) else style.addLayer(layer)
     }
 
     // ---- stop pins ----------------------------------------------------

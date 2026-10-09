@@ -6,6 +6,8 @@ import android.app.Application
 import android.content.Context
 import android.location.Location
 import android.os.Bundle
+import com.mapbox.android.core.location.LocationEngineProvider
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.LifecycleOwner
 import com.eopeter.fluttermapboxnavigation.databinding.NavigationActivityBinding
@@ -29,6 +31,7 @@ import org.json.JSONObject
 import com.mapbox.maps.Style
 import com.mapbox.api.directions.v5.DirectionsCriteria
 import com.mapbox.api.directions.v5.models.RouteOptions
+import com.mapbox.geojson.LineString
 import com.mapbox.geojson.Point
 import com.mapbox.navigation.base.extensions.applyDefaultNavigationOptions
 import com.mapbox.navigation.base.extensions.applyLanguageAndVoiceUnitOptions
@@ -44,6 +47,9 @@ import com.mapbox.navigation.core.directions.session.RoutesObserver
 import com.mapbox.navigation.core.lifecycle.MapboxNavigationApp
 import com.mapbox.navigation.core.trip.session.*
 import io.flutter.plugin.common.EventChannel
+import com.mapbox.turf.TurfConstants
+import com.mapbox.turf.TurfMeasurement
+import com.mapbox.turf.TurfMisc
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
@@ -77,6 +83,9 @@ open class TurnByTurn(
     open fun initNavigation() {
         val navigationOptions = NavigationOptions.Builder(this.context)
             .accessToken(this.token)
+            // Fixes that wander while the driver stands still are held
+            // in place before the navigator sees them.
+            .locationEngine(SteadyLocationEngine(LocationEngineProvider.getBestLocationEngine(this.context)))
             .build()
 
         MapboxNavigationApp
@@ -171,6 +180,11 @@ open class TurnByTurn(
                 } else if (!enabled && wasOn) {
                     SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
                 }
+                result.success(true)
+            }
+            "setRouteLook" -> {
+                val look = methodCall.argument<String>("look") ?: "normal"
+                this.mapLook.setRouteLook(look, if (look == "left") this.routeStillAhead() else null)
                 result.success(true)
             }
             "setNightMode" -> {
@@ -512,6 +526,9 @@ open class TurnByTurn(
     private var lastProgress: RouteProgress? = null
     private var activeRoutes: List<NavigationRoute> = emptyList()
     private var offRoute = false
+
+    /// When the phone last reported a position, on the uptime clock.
+    private var lastRawFixAtMs: Long? = null
     private var rerouting = false
     private var arrived = false
     private var speedLimitKmph: Int? = null
@@ -543,7 +560,7 @@ open class TurnByTurn(
         }
 
         override fun onNewRawLocation(rawLocation: Location) {
-            // no impl
+            this@TurnByTurn.lastRawFixAtMs = SystemClock.elapsedRealtime()
         }
     }
 
@@ -642,6 +659,16 @@ open class TurnByTurn(
         }
     }
 
+    /** The part of the route in use that the driver has not driven yet. */
+    private fun routeStillAhead(): LineString? {
+        val geometry = this.activeRoutes.firstOrNull()?.directionsRoute?.geometry() ?: return null
+        val line = LineString.fromPolyline(geometry, 6)
+        val travelled = (this.lastProgress?.distanceTraveled ?: 0f).toDouble()
+        val length = TurfMeasurement.length(line, TurfConstants.UNIT_METERS)
+        if (travelled <= 0.0 || travelled >= length) return line
+        return TurfMisc.lineSliceAlong(line, travelled, length, TurfConstants.UNIT_METERS)
+    }
+
     /** The alternative worth offering right now, if any. */
     private fun fasterAlternative(): NavigationRoute? {
         val navigation = MapboxNavigationApp.current() ?: return null
@@ -689,6 +716,11 @@ open class TurnByTurn(
             )
             state.put("offRoute", this.offRoute)
             state.put("rerouting", this.rerouting)
+            // The navigator keeps ticking when fixes stop, so the host
+            // needs to be told how old the last real one is.
+            this.lastRawFixAtMs?.let {
+                state.put("fixAgeSeconds", (SystemClock.elapsedRealtime() - it) / 1000.0)
+            }
             state.put("arrived", this.arrived)
 
             progress.currentLegProgress?.currentStepProgress?.let {

@@ -18,6 +18,7 @@ enum HostMapColor {
     static let green = UIColor(red: 0x2B / 255.0, green: 0x73 / 255.0, blue: 0x48 / 255.0, alpha: 1)
     static let buildingFill = UIColor(red: 0xBF / 255.0, green: 0xDC / 255.0, blue: 0xCB / 255.0, alpha: 1)
     static let ink = UIColor(red: 0x2B / 255.0, green: 0x2B / 255.0, blue: 0x2B / 255.0, alpha: 1)
+    static let leftRoute = UIColor(red: 0x8E / 255.0, green: 0x8B / 255.0, blue: 0x83 / 255.0, alpha: 1)
 
     /// Route line, casing, traffic and puck colours, applied through the
     /// appearance proxy by the day and night styles. Set per idiom, the
@@ -91,6 +92,63 @@ extension NavigationFactory {
         guard night != _nightMode else { return }
         _nightMode = night
         _navigationViewController?.styleManager?.applyStyle(type: night ? .night : .day)
+    }
+
+    // MARK: Route look
+
+    /// "normal", "faded" or "left" (see `NavRouteLook` on the Dart side).
+    func setRouteLook(_ look: String) {
+        guard look != _routeLook else { return }
+        _routeLook = look
+        applyRouteLook()
+    }
+
+    /// Runs again on every tick while the look is not the normal one:
+    /// the SDK rebuilds its route layers whenever it redraws the route.
+    func applyRouteLook() {
+        guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
+        let style = mapView.mapboxMap.style
+        // The SDK names its layers after the route object; the suffixes
+        // are what is stable.
+        let mainLine = style.allLayerIdentifiers.map { $0.id }.filter {
+            $0.hasSuffix(".main.route_line") || $0.hasSuffix(".main.route_line_casing")
+        }
+        let opacity: Double
+        switch _routeLook {
+        case "faded": opacity = 0.55
+        case "left": opacity = 0
+        default: opacity = 1
+        }
+        for id in mainLine {
+            try? style.setLayerProperty(for: id, property: "line-opacity", value: opacity)
+        }
+
+        let leftId = "host-left-route"
+        guard _routeLook == "left" else {
+            if style.layerExists(withId: leftId) { try? style.removeLayer(withId: leftId) }
+            if style.sourceExists(withId: leftId) { try? style.removeSource(withId: leftId) }
+            return
+        }
+        // Drawn once, when the driver leaves: the part of the old route
+        // that was still ahead of them.
+        guard !style.layerExists(withId: leftId),
+              let progress = _lastProgress,
+              let shape = progress.route.shape,
+              let ahead = shape.trimmed(from: progress.distanceTraveled, to: shape.distance() ?? 0) else { return }
+        var source = GeoJSONSource()
+        source.data = .geometry(.lineString(ahead))
+        try? style.addSource(source, id: leftId)
+        var layer = LineLayer(id: leftId)
+        layer.source = leftId
+        layer.lineColor = .constant(StyleColor(HostMapColor.leftRoute))
+        layer.lineWidth = .constant(8)
+        layer.lineCap = .constant(.round)
+        layer.lineDasharray = .constant([0.5, 1.5])
+        if let above = mainLine.last {
+            try? style.addLayer(layer, layerPosition: .above(above))
+        } else {
+            try? style.addLayer(layer)
+        }
     }
 
     // MARK: Mapbox wordmark and attribution

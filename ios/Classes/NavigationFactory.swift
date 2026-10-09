@@ -89,6 +89,8 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _doorPointManager: PointAnnotationManager?
     var _doorPolygonManager: PolygonAnnotationManager?
     var _offRoute = false
+    var _lastRawFixAt: Date?
+    var _routeLook = "normal"
     var _rerouting = false
     var _declinedAlternatives = Set<AlternativeRoute.ID>()
     var _lastProgress: RouteProgress?
@@ -486,6 +488,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     //MARK: NavigationViewController Delegates
     public func navigationViewController(_ navigationViewController: NavigationViewController, didUpdate progress: RouteProgress, with location: CLLocation, rawLocation: CLLocation) {
         _lastKnownLocation = location
+        _lastRawFixAt = rawLocation.timestamp
         _distanceRemaining = progress.distanceRemaining
         _durationRemaining = progress.durationRemaining
         sendEvent(eventType: MapBoxEventType.navigation_running)
@@ -514,6 +517,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         emitNavState()
         updateDoorView()
         placeOrnaments()
+        if _routeLook != "normal" { applyRouteLook() }
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didArriveAt waypoint: Waypoint) -> Bool {

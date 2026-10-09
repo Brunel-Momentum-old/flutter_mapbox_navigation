@@ -34,14 +34,6 @@ final class LocationRelay: NSObject, CLLocationManagerDelegate {
     /// within a second.
     static let movingSpeed: CLLocationSpeed = 0.7
 
-    /// How far a fix may land from the held spot and still count as the
-    /// same spot: twice the fix's own accuracy (two fixes each off by
-    /// their error can sit that far apart), kept between these bounds so
-    /// a very confident fix still forgives ordinary wander and a very
-    /// poor one cannot pin a moving driver for long.
-    static let minSlack: CLLocationDistance = 10
-    static let maxSlack: CLLocationDistance = 40
-
     weak var target: CLLocationManagerDelegate?
 
     /// Where the driver is taken to be standing.
@@ -58,8 +50,7 @@ final class LocationRelay: NSObject, CLLocationManagerDelegate {
             held = fix
             return fix
         }
-        let slack = min(max(fix.horizontalAccuracy * 2, Self.minSlack), Self.maxSlack)
-        if let held = held, fix.distance(from: held) <= slack {
+        if let held = held, fix.distance(from: held) <= slack(for: fix) {
             return standing(at: held, reportedBy: fix)
         }
         // Somewhere new. Without a speed from the receiver it is a place
@@ -68,6 +59,18 @@ final class LocationRelay: NSObject, CLLocationManagerDelegate {
         // until the next fix arrives.
         held = fix
         return fix.speed < 0 ? standing(at: fix, reportedBy: fix) : fix
+    }
+
+    /// How far a fix may land from the held spot and still count as the
+    /// same spot. A phone that says "not moving" is believed over a wide
+    /// margin: its speed is measured, its position is the part that
+    /// wanders. With no speed at all there is less to go on, so less is
+    /// forgiven and a driver who really is moving is not pinned for long.
+    private func slack(for fix: CLLocation) -> CLLocationDistance {
+        if fix.speed >= 0 {
+            return min(max(fix.horizontalAccuracy * 3, 30), 75)
+        }
+        return min(max(fix.horizontalAccuracy * 2, 10), 40)
     }
 
     private func standing(at spot: CLLocation, reportedBy fix: CLLocation) -> CLLocation {
