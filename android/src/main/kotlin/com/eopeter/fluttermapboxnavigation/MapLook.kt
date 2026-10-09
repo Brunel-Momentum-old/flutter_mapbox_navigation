@@ -407,12 +407,15 @@ class MapLook(private val context: Context, private val navigationView: Navigati
                 }
                 // No footprint under the pin once it has had time to
                 // come on screen: mark the spot instead of the building.
-                showDoorMarker(destination, ring = buildings.isEmpty() && attempt >= 4)
+                // Once the building itself is lit up, nothing is drawn
+                // over it: a number tag on top hid the very house the
+                // driver is looking for.
+                showDoorMarker(destination, ring = buildings.isEmpty() && attempt >= 4, tag = buildings.isEmpty())
             }
         }
     }
 
-    private fun showDoorMarker(point: Point, ring: Boolean) {
+    private fun showDoorMarker(point: Point, ring: Boolean, tag: Boolean) {
         val view = mapView ?: return
         val polygons = doorPolygonManager ?: view.annotations.createPolygonAnnotationManager().also {
             doorPolygonManager = it
@@ -431,6 +434,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             )
         }
         points.deleteAll()
+        if (!tag) return
         points.create(
             PointAnnotationOptions()
                 .withPoint(point)

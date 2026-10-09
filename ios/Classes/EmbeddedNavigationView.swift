@@ -212,7 +212,8 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
             return
         }
         if (navigationService != nil) {
-            navigationService.stop()
+            Self.finish(navigationService)
+            navigationService = nil
         }
         navigationMapView?.removeRoutes()
         routeResponse = nil
@@ -355,11 +356,19 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
     /// a live one.
     func tearDownEmbeddedNavigation() {
         guard let previous = _navigationViewController else { return }
-        previous.navigationService.endNavigation(feedback: nil)
+        Self.finish(previous.navigationService)
         previous.willMove(toParent: nil)
         previous.view.removeFromSuperview()
         previous.removeFromParent()
         _navigationViewController = nil
+        navigationService = nil
+    }
+
+    deinit {
+        // Flutter let go of the view without a finishNavigation first.
+        if let live = _navigationViewController {
+            Self.finish(live.navigationService)
+        }
     }
 
     func startEmbeddedNavigation(arguments: NSDictionary?, result: @escaping FlutterResult) {
@@ -381,6 +390,10 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         // Double start: end the live session before building a new service.
         tearDownEmbeddedNavigation()
         isEmbeddedNavigation = true
+        _guidanceStartedAt = nil
+        _navigatorBehind = false
+        _noRerouteUntil = nil
+        navTrace("trip starting")
 
         let navLocationManager = self._simulateRoute ? SimulatedLocationManager(route: routes[selectedRouteIndex]) : HostLocationManager()
         // Never `.onPoorGPS`: it drives the puck along the route by itself

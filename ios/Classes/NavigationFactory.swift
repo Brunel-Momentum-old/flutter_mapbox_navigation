@@ -90,6 +90,12 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _doorPolygonManager: PolygonAnnotationManager?
     var _offRoute = false
     var _lastRawFixAt: Date?
+    var _guidanceStartedAt: Date?
+
+    /// This trip began with the navigator still standing where the last
+    /// one ended, and it has not yet taken in where the driver is.
+    var _navigatorBehind = false
+    var _noRerouteUntil: Date?
     var _routeLook = "normal"
     var _rerouting = false
     var _declinedAlternatives = Set<AlternativeRoute.ID>()
@@ -343,14 +349,31 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     /// The embedded branch and the "nothing to end" branch used to return
     /// without replying, so a Dart `await finishNavigation()` sat until its
     /// own timeout (the driver-visible "back from navigation hangs").
+    /// Ends a trip for good.
+    ///
+    /// `endNavigation` on the service only stops its location updates:
+    /// the route stays set in the navigator, and the route controller
+    /// keeps listening to it, until the controller is deallocated. That
+    /// can be long after the screen has gone. The next trip then started
+    /// beside a live one (the SDK logs "Two simultaneous active
+    /// navigation sessions"), with the navigator still on the old route:
+    /// the driver was at once "off route" and was re-routed from where
+    /// the last trip ended. The route controller is told to finish now.
+    static func finish(_ service: NavigationService) {
+        navTrace("trip finished")
+        service.endNavigation(feedback: nil)
+        service.router.finishRouting()
+    }
+
     func endNavigation(result: FlutterResult?)
     {
+        navTrace("finishNavigation asked, live trip: \(_navigationViewController != nil)")
         sendEvent(eventType: MapBoxEventType.navigation_finished)
         guard let navigationViewController = self._navigationViewController else {
             result?(true)
             return
         }
-        navigationViewController.navigationService.endNavigation(feedback: nil)
+        Self.finish(navigationViewController.navigationService)
         if(isEmbeddedNavigation)
         {
             navigationViewController.willMove(toParent: nil)
@@ -489,12 +512,13 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     public func navigationViewController(_ navigationViewController: NavigationViewController, didUpdate progress: RouteProgress, with location: CLLocation, rawLocation: CLLocation) {
         _lastKnownLocation = location
         _lastRawFixAt = rawLocation.timestamp
+        settleNavigator(navigationViewController, at: location, phone: rawLocation)
         navTrace("tick lat=\(String(format: "%.5f", location.coordinate.latitude)) lng=\(String(format: "%.5f", location.coordinate.longitude)) course=\(Int(location.course)) speed=\(String(format: "%.1f", location.speed)) rawOffset=\(Int(location.distance(from: rawLocation))) rawAge=\(String(format: "%.1f", Date().timeIntervalSince(rawLocation.timestamp))) remaining=\(Int(progress.distanceRemaining)) toManeuver=\(Int(progress.currentLegProgress.currentStepProgress.distanceRemaining)) offRoute=\(_offRoute) rerouting=\(_rerouting) cam=\(String(describing: navigationViewController.navigationMapView?.navigationCamera.state)) camBearing=\(Int(navigationViewController.navigationMapView?.mapView.cameraState.bearing ?? -1))")
         _distanceRemaining = progress.distanceRemaining
         _durationRemaining = progress.durationRemaining
         sendEvent(eventType: MapBoxEventType.navigation_running)
         //_currentLegDescription =  progress.currentLeg.description
-        if(_eventSink != nil)
+        if(_eventSink != nil && !_navigatorBehind)
         {
             let jsonEncoder = JSONEncoder()
             
@@ -515,7 +539,10 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             }
         }
         _lastProgress = progress
-        emitNavState()
+        // While the navigator is still where the last trip ended, what it
+        // says about this one is not true yet; the host keeps its
+        // "finding the route" state for the second or two it takes.
+        if !_navigatorBehind { emitNavState() }
         updateDoorView()
         placeOrnaments()
         if _routeLook != "normal" { applyRouteLook() }
@@ -543,6 +570,10 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, shouldRerouteFrom location: CLLocation) -> Bool {
+        guard mayReroute(from: location) else {
+            navTrace("off route ignored: navigator \(_lastKnownLocation.map { String(Int($0.distance(from: location))) } ?? "?") m from the phone, behind=\(_navigatorBehind)")
+            return false
+        }
         if !_offRoute {
             _offRoute = true
             navTrace("off route at lat=\(String(format: "%.5f", location.coordinate.latitude)) lng=\(String(format: "%.5f", location.coordinate.longitude))")
@@ -550,6 +581,76 @@ extension NavigationFactory : NavigationViewControllerDelegate {
             emitNavState()
         }
         return _shouldReRoute
+    }
+
+    // MARK: A navigator that starts a trip somewhere else
+
+    /// The navigator outlives a trip, and keeps the position the last one
+    /// ended at. At the start of the next trip it still stands there for
+    /// a second or two. Two things went wrong with that:
+    ///
+    /// - It called the driver off route and asked for a new route from
+    ///   that old spot, with the jump to the real position read as the
+    ///   way they were driving. The trip then did not start where the
+    ///   driver was, or set off the wrong way round the block, and the
+    ///   route stuck whenever it happened to pass them.
+    /// - Where the new route ran through the old spot, the navigator
+    ///   took the driver to be that far along it already, and stayed
+    ///   there.
+    ///
+    /// So while the navigator is behind, no re-route is allowed; and the
+    /// moment it has the phone's position, the trip's own route is set
+    /// again, which makes the navigator place the driver on it afresh.
+    func settleNavigator(_ navigationViewController: NavigationViewController, at navigator: CLLocation, phone: CLLocation) {
+        let behind = navigator.distance(from: phone) > Self.navigatorSlack(for: phone)
+        if _guidanceStartedAt == nil {
+            let started = Date()
+            _guidanceStartedAt = started
+            _navigatorBehind = behind
+            if behind {
+                navTrace("trip starts with the navigator \(Int(navigator.distance(from: phone))) m from the phone")
+                // It catches up within a few fixes. If the fixes never
+                // come, the host is not left waiting for it for ever.
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.navigatorCatchUpLimit) { [weak self] in
+                    guard let self = self, self._navigatorBehind, self._guidanceStartedAt == started else { return }
+                    navTrace("navigator still behind after \(Int(Self.navigatorCatchUpLimit)) s: reporting it as it is")
+                    self._navigatorBehind = false
+                    self.emitNavState()
+                }
+            }
+            return
+        }
+        guard _navigatorBehind, !behind else { return }
+        _navigatorBehind = false
+        // A moment for the navigator to take the route in again before a
+        // re-route may be asked for.
+        _noRerouteUntil = Date().addingTimeInterval(3)
+        let router = navigationViewController.navigationService.router
+        let voice = navigationViewController.voiceController
+        let dings = voice?.playRerouteSound ?? true
+        // Setting the same route again is not a re-route to tell the
+        // driver about.
+        voice?.playRerouteSound = false
+        navTrace("navigator has the phone's position: route set again")
+        router.updateRoute(with: router.indexedRouteResponse, routeOptions: nil) { [weak voice] _ in
+            voice?.playRerouteSound = dings
+        }
+    }
+
+    /// Longest the host is kept waiting for the navigator to catch up.
+    static let navigatorCatchUpLimit: TimeInterval = 6
+
+    /// How far the navigator's position may sit from the phone's fix and
+    /// still be the same place: the fix's error, and the second of travel
+    /// the navigator looks ahead by.
+    static func navigatorSlack(for fix: CLLocation) -> CLLocationDistance {
+        return max(25, fix.horizontalAccuracy * 2) + 1.5 * max(0, fix.speed)
+    }
+
+    func mayReroute(from fix: CLLocation) -> Bool {
+        guard let navigator = _lastKnownLocation, !_navigatorBehind else { return false }
+        if let until = _noRerouteUntil, Date() < until { return false }
+        return navigator.distance(from: fix) <= Self.navigatorSlack(for: fix)
     }
 
     public func navigationViewController(_ navigationViewController: NavigationViewController, willRerouteFrom location: CLLocation?) {

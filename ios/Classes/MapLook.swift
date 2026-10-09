@@ -361,12 +361,17 @@ extension NavigationFactory {
                 self._doorView = current
                 // No footprint under the pin after it has had time to
                 // come on screen: mark the spot instead of the building.
-                self.showDoorMarker(at: destination, label: current.label, ring: !found && attempt >= 4)
+                // Once the building itself is lit up, nothing is drawn
+                // over it: a number tag on top hid the very house the
+                // driver is looking for. The tag marks the spot only
+                // while there is no building to light.
+                self.showDoorMarker(at: destination, label: current.label,
+                                    ring: !found && attempt >= 4, tag: !found)
             }
         }
     }
 
-    private func showDoorMarker(at coordinate: CLLocationCoordinate2D, label: String?, ring: Bool) {
+    private func showDoorMarker(at coordinate: CLLocationCoordinate2D, label: String?, ring: Bool, tag: Bool) {
         guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
         if _doorPolygonManager == nil {
             _doorPolygonManager = mapView.annotations.makePolygonAnnotationManager(id: "host-door-ring")
@@ -382,6 +387,10 @@ extension NavigationFactory {
             _doorPolygonManager?.annotations = [polygon]
         } else {
             _doorPolygonManager?.annotations = []
+        }
+        guard tag else {
+            _doorPointManager?.annotations = []
+            return
         }
         var marker = PointAnnotation(coordinate: coordinate)
         let text = (label ?? "").trimmingCharacters(in: .whitespaces)
