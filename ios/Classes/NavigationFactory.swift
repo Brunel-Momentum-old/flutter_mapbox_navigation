@@ -489,6 +489,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     public func navigationViewController(_ navigationViewController: NavigationViewController, didUpdate progress: RouteProgress, with location: CLLocation, rawLocation: CLLocation) {
         _lastKnownLocation = location
         _lastRawFixAt = rawLocation.timestamp
+        navTrace("tick lat=\(String(format: "%.5f", location.coordinate.latitude)) lng=\(String(format: "%.5f", location.coordinate.longitude)) course=\(Int(location.course)) speed=\(String(format: "%.1f", location.speed)) rawOffset=\(Int(location.distance(from: rawLocation))) rawAge=\(String(format: "%.1f", Date().timeIntervalSince(rawLocation.timestamp))) remaining=\(Int(progress.distanceRemaining)) toManeuver=\(Int(progress.currentLegProgress.currentStepProgress.distanceRemaining)) offRoute=\(_offRoute) rerouting=\(_rerouting) cam=\(String(describing: navigationViewController.navigationMapView?.navigationCamera.state)) camBearing=\(Int(navigationViewController.navigationMapView?.mapView.cameraState.bearing ?? -1))")
         _distanceRemaining = progress.distanceRemaining
         _durationRemaining = progress.durationRemaining
         sendEvent(eventType: MapBoxEventType.navigation_running)
@@ -544,6 +545,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
     public func navigationViewController(_ navigationViewController: NavigationViewController, shouldRerouteFrom location: CLLocation) -> Bool {
         if !_offRoute {
             _offRoute = true
+            navTrace("off route at lat=\(String(format: "%.5f", location.coordinate.latitude)) lng=\(String(format: "%.5f", location.coordinate.longitude))")
             sendEvent(eventType: MapBoxEventType.user_off_route)
             emitNavState()
         }

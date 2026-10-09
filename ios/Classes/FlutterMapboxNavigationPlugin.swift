@@ -7,6 +7,14 @@ import MapboxNavigation
 
 public class FlutterMapboxNavigationPlugin: NavigationFactory, FlutterPlugin {
   public static func register(with registrar: FlutterPluginRegistrar) {
+    // Left to itself the navigator keeps producing positions when fixes
+    // stop, carrying the driver on along the route at their last speed.
+    // A phone that lost GPS mid-drive was "driven" to the stop and marked
+    // as arrived. With a patience this long it speaks only when the phone
+    // has a real fix. This has to be set before anything else touches the
+    // navigation SDK.
+    NavigationSettings.shared.initialize(with: .init(
+        statusUpdatingSettings: StatusUpdatingSettings(updatingPatience: 24 * 60 * 60)))
     let channel = FlutterMethodChannel(name: "flutter_mapbox_navigation", binaryMessenger: registrar.messenger())
     let eventChannel = FlutterEventChannel(name: "flutter_mapbox_navigation/events", binaryMessenger: registrar.messenger())
     let instance = FlutterMapboxNavigationPlugin()

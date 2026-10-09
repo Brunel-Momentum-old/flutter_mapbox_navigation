@@ -156,6 +156,10 @@ open class TurnByTurn(
                     (methodCall.argument<Double>("right") ?: 0.0) * density,
                 )
                 this.applyHostPadding()
+                // The door view frames the map by hand. Left to the next
+                // fix, the marker sat behind the host's sheet whenever
+                // the sheet came up.
+                if (this.mapLook.isDoorView) this.lastLocation?.let { this.mapLook.onLocation(it) }
                 result.success(true)
             }
             "setStopPins" -> {

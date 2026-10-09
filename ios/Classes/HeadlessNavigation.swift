@@ -91,6 +91,7 @@ extension NavigationFactory {
 
     @objc func headlessCameraStateDidChange(_ notification: Notification) {
         guard let state = notification.userInfo?[NavigationCamera.NotificationUserInfoKey.state] as? NavigationCameraState else { return }
+        navTrace("camera \(state)")
         switch state {
         case .following, .transitionToFollowing:
             reportCameraState("following")
@@ -113,6 +114,7 @@ extension NavigationFactory {
                 } else if self._overviewRequested {
                     camera.moveToOverview()
                 } else {
+                    navTrace("camera idle with nobody touching it: back to following")
                     camera.follow()
                 }
             }
@@ -150,8 +152,13 @@ extension NavigationFactory {
         _topSpacer?.height = max(0, _cameraPaddingTop - safeArea.top)
         _bottomSpacer?.height = max(0, _cameraPaddingBottom - safeArea.bottom)
         navigationViewController.view.setNeedsLayout()
+        navTrace("padding top=\(Int(_cameraPaddingTop)) bottom=\(Int(_cameraPaddingBottom))")
         // After the SDK has laid its own ornaments out for the new height.
         DispatchQueue.main.async { [weak self] in self?.placeOrnaments() }
+        // The door view frames the map by hand. Left to the next tick, the
+        // marker sat behind the host's sheet for a second or two whenever
+        // the sheet came up.
+        if _doorView != nil { updateDoorView(duration: 0.3) }
     }
 
     func setMuted(_ muted: Bool) {
