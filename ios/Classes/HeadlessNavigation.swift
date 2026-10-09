@@ -92,6 +92,7 @@ extension NavigationFactory {
     @objc func headlessCameraStateDidChange(_ notification: Notification) {
         guard let state = notification.userInfo?[NavigationCamera.NotificationUserInfoKey.state] as? NavigationCameraState else { return }
         navTrace("camera \(state)")
+        wakeMap()
         switch state {
         case .following, .transitionToFollowing:
             reportCameraState("following")
@@ -142,6 +143,8 @@ extension NavigationFactory {
         if recognizer.state == .began || recognizer.state == .changed {
             _lastUserGestureAt = Date()
         }
+        // Through to the end of the gesture, and the glide after it.
+        wakeMap()
     }
 
     /// Applies the host's covered insets, given in points from the edges
@@ -153,6 +156,7 @@ extension NavigationFactory {
         _bottomSpacer?.height = max(0, _cameraPaddingBottom - safeArea.bottom)
         navigationViewController.view.setNeedsLayout()
         navTrace("padding top=\(Int(_cameraPaddingTop)) bottom=\(Int(_cameraPaddingBottom))")
+        wakeMap()
         // After the SDK has laid its own ornaments out for the new height.
         DispatchQueue.main.async { [weak self] in self?.placeOrnaments() }
         // The door view frames the map by hand. Left to the next tick, the
@@ -167,11 +171,13 @@ extension NavigationFactory {
 
     func showOverview() {
         _overviewRequested = true
+        wakeMap()
         _navigationViewController?.navigationMapView?.navigationCamera.moveToOverview()
     }
 
     func recenter() {
         _overviewRequested = false
+        wakeMap()
         // In the door view the camera is driven by hand on every tick.
         guard _doorView == nil else {
             reportCameraState("following")

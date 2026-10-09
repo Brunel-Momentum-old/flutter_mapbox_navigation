@@ -81,6 +81,12 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _overviewRequested = false
     var _lastUserGestureAt: Date?
 
+    // How often the maps draw — see MapPower.swift.
+    var _stillTicks = 0
+    var _lastTickLocation: CLLocation?
+    var _mapAwakeUntil = Date.distantPast
+    let _frameTrace: FrameTrace? = hostNavTrace ? FrameTrace() : nil
+
     // Map look, stop pins and door view — see MapLook.swift.
     var _nightMode = false
     var _stopPins: [[String: Any]] = []
@@ -396,6 +402,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _routeLook = "normal"
         _doorView = nil
         _lastProgress = nil
+        _stillTicks = 0
+        _lastTickLocation = nil
+        _mapAwakeUntil = Date.distantPast
+        _frameTrace?.stopWatching("nav")
     }
 
     func endNavigation(result: FlutterResult?)
@@ -587,6 +597,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         updateDoorView()
         placeOrnaments()
         if _routeLook != "normal" { applyRouteLook() }
+        if let map = navigationViewController.navigationMapView { paceMap(map, at: location, phone: rawLocation) }
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didArriveAt waypoint: Waypoint) -> Bool {

@@ -106,6 +106,7 @@ extension NavigationFactory {
     func setNightMode(_ night: Bool) {
         guard night != _nightMode else { return }
         _nightMode = night
+        wakeMap()
         _navigationViewController?.styleManager?.applyStyle(type: night ? .night : .day)
         // The new style drops the layers drawn here. Forgetting what is
         // on the map makes the next tick draw it again.
@@ -316,10 +317,18 @@ extension NavigationFactory {
         guard let mapView = _navigationViewController?.navigationMapView?.mapView else { return }
         let bottom = max(0, _cameraPaddingBottom - mapView.safeAreaInsets.bottom) + 6
         var options = mapView.ornaments.options
+        let logo = CGPoint(x: 96, y: bottom)
+        let attribution = CGPoint(x: 96, y: bottom + 26)
+        // Setting them lays every ornament out again, and this runs on
+        // every tick.
+        if options.logo.position == .bottomRight, options.logo.margins == logo,
+           options.attributionButton.position == .bottomRight, options.attributionButton.margins == attribution {
+            return
+        }
         options.logo.position = .bottomRight
-        options.logo.margins = CGPoint(x: 96, y: bottom)
+        options.logo.margins = logo
         options.attributionButton.position = .bottomRight
-        options.attributionButton.margins = CGPoint(x: 96, y: bottom + 26)
+        options.attributionButton.margins = attribution
         mapView.ornaments.options = options
     }
 
@@ -435,6 +444,7 @@ extension NavigationFactory {
         let enabled = arguments?["enabled"] as? Bool ?? false
         guard let navigationViewController = _navigationViewController,
               let map = navigationViewController.navigationMapView else { return }
+        wakeMap()
         guard enabled else {
             leaveDoorView()
             return
@@ -511,7 +521,12 @@ extension NavigationFactory {
                                    zoom: zoom,
                                    bearing: location.course >= 0 ? location.course : nil,
                                    pitch: 20)
-        map.mapView.camera.ease(to: camera, duration: duration, curve: .linear, completion: nil)
+        // Stopped at the door with the camera already there, there is
+        // nothing to move; an animation to the same place still makes the
+        // map draw every frame of it.
+        if !cameraIs(at: camera, on: map.mapView) {
+            map.mapView.camera.ease(to: camera, duration: duration, curve: .linear, completion: nil)
+        }
 
         if let destination = door.coordinate, !door.footprintFound, door.highlightAttempts < 12 {
             door.highlightAttempts += 1
@@ -531,6 +546,30 @@ extension NavigationFactory {
                                     ring: !found && attempt >= 4, tag: !found)
             }
         }
+    }
+
+    /// True when the map already shows what `camera` asks for.
+    private func cameraIs(at camera: CameraOptions, on mapView: MapView) -> Bool {
+        let now = mapView.cameraState
+        if let center = camera.center,
+           CLLocation(latitude: center.latitude, longitude: center.longitude)
+            .distance(from: CLLocation(latitude: now.center.latitude, longitude: now.center.longitude)) > 0.3 {
+            return false
+        }
+        if let zoom = camera.zoom, abs(zoom - now.zoom) > 0.01 { return false }
+        if let pitch = camera.pitch, abs(pitch - now.pitch) > 0.5 { return false }
+        if let bearing = camera.bearing {
+            let turn = abs((bearing - now.bearing).truncatingRemainder(dividingBy: 360))
+            if min(turn, 360 - turn) > 0.5 { return false }
+        }
+        if let padding = camera.padding {
+            let was = now.padding
+            if abs(padding.top - was.top) > 0.5 || abs(padding.bottom - was.bottom) > 0.5
+                || abs(padding.left - was.left) > 0.5 || abs(padding.right - was.right) > 0.5 {
+                return false
+            }
+        }
+        return true
     }
 
     private func showDoorMarker(at coordinate: CLLocationCoordinate2D, label: String?, ring: Bool, tag: Bool) {

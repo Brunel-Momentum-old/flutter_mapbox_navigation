@@ -15,6 +15,9 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
     let eventChannel: FlutterEventChannel
 
     var navigationMapView: NavigationMapView!
+    /// The base map's own location provider, kept while that map is
+    /// covered and resting (`restBaseMap`).
+    var _baseMapLocationProvider: LocationProvider?
     var arguments: NSDictionary?
 
     var routeResponse: RouteResponse?
@@ -169,6 +172,8 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
     {
         navigationMapView = NavigationMapView(frame: frame)
         navigationMapView.delegate = self
+        setRate(MapPower.moving, on: navigationMapView.mapView)
+        _frameTrace?.watch(navigationMapView.mapView, as: "base")
 
         if(self.arguments != nil)
         {
@@ -387,6 +392,7 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
     override func releaseTripObjects() {
         super.releaseTripObjects()
         navigationService = nil
+        wakeBaseMap()
     }
 
     func startEmbeddedNavigation(arguments: NSDictionary?, result: @escaping FlutterResult) {
@@ -459,6 +465,11 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
         navigationViewController.didMove(toParent: hostViewController)
         makeHeadless(navigationViewController)
         applyCameraPadding()
+        restBaseMap()
+        if let map = navigationViewController.navigationMapView?.mapView {
+            setRate(MapPower.moving, on: map)
+            _frameTrace?.watch(map, as: "nav")
+        }
         result(true)
 
     }
