@@ -34,9 +34,22 @@ class SteadyLocationEngine(private val source: LocationEngine) : LocationEngine 
         /** Marks a fix this engine made up, so the host does not count it as the phone speaking. */
         const val MADE_UP = "hostMadeUpFix"
 
-        /** How long the phone may say nothing before a moving driver is taken to have been lost. */
-        private const val SILENCE_MS = 3000L
+        /**
+         * How long the phone may say nothing before a moving driver is
+         * taken to have been lost. Some phones report only every few
+         * seconds while all is well; anything much shorter than this
+         * stood those drivers still between two ordinary fixes.
+         */
+        private const val SILENCE_MS = 8000L
     }
+
+    /**
+     * Whether the route has the driver in a tunnel. This engine knows
+     * nothing of the route, so whoever watches the route's progress keeps
+     * it up to date.
+     */
+    @Volatile
+    var inTunnel = false
 
     private val steadier = LocationSteadier()
     private val relays =
@@ -93,8 +106,14 @@ class SteadyLocationEngine(private val source: LocationEngine) : LocationEngine 
      * speed, as far as the stop. It is told once that they are standing
      * where they were last seen, and holds them there until the phone
      * speaks again.
+     *
+     * Not in a tunnel. No fix arrives in one, and there the navigator
+     * carrying the driver along the route is exactly what is wanted:
+     * told "standing", it kept them at the tunnel mouth for the whole
+     * length of it.
      */
     private fun onSilence() {
+        if (inTunnel) return
         val last = lastReal ?: return
         if (!last.hasSpeed() || last.speed < LocationSteadier.MOVING_SPEED) return
         val standing = Location(last).apply {
@@ -119,16 +138,45 @@ class LocationSteadier {
         const val MOVING_SPEED = 0.7f
 
         /**
+         * A fix this old when it arrives is the phone's cached one, not
+         * where the driver is now.
+         */
+        const val STALE_AFTER_MS = 10_000L
+
+        /**
+         * How many of the latest fixes are looked at to tell a driver
+         * from a phone that is only wandering.
+         */
+        const val WINDOW_FIXES = 6
+
+        /** Fewer fixes than this are too few to say the driver is going anywhere. */
+        const val FIXES_TO_SHOW_TRAVEL = 4
+
+        /**
+         * The latest fixes have to cover at least this many metres from
+         * one to the next, all told, before they can count as travel.
+         */
+        const val TRAVEL_PATH_M = 15f
+
+        /**
+         * And they have to end at least this share of that distance from
+         * where they began. A driver's fixes line up; a parked phone's
+         * wander doubles back on itself.
+         */
+        const val TRAVEL_STRAIGHTNESS = 0.8f
+
+        /**
          * A phone that reports no speed gives nothing to go on but where
-         * its fixes land. This many in a row landing together is a driver
-         * who has stopped.
+         * its fixes land. At least this many of the latest, all landing
+         * together, is a driver who has stopped.
          */
         const val QUIET_FIXES_TO_REST = 4
 
         /**
-         * At rest, the spot is moved to a newer fix of equal or better
-         * accuracy this often, so an early poor fix cannot pin the driver
-         * in the wrong place for long.
+         * At rest, the spot is moved to the newest fix this often,
+         * whatever accuracy either claims: a poor fix that claimed to be
+         * a good one could otherwise pin the driver in the wrong place
+         * for as long as they stood there.
          */
         const val REFRESH_REST_EVERY_MS = 30_000L
     }
@@ -137,76 +185,96 @@ class LocationSteadier {
     private var held: Location? = null
     private var heldSinceMs = 0L
 
-    /** The latest fixes while not at rest, for telling when a driver with no speed reading has stopped. */
-    private val recent = ArrayList<Location>()
+    /**
+     * The latest fresh fixes, whatever was done with them. Never cleared,
+     * only trimmed: what led up to the driver being let go still counts
+     * straight after it.
+     */
+    private val window = ArrayList<Location>()
 
     @Synchronized
     fun steadied(fix: Location, nowMs: Long = SystemClock.elapsedRealtime()): Location {
+        // A cached fix says where the driver was. It goes through as it
+        // is and decides nothing.
+        if (nowMs - fix.elapsedRealtimeNanos / 1_000_000L > STALE_AFTER_MS) return fix
+
         val speedKnown = fix.hasSpeed()
         if (speedKnown && fix.speed >= MOVING_SPEED) {
-            moving()
+            held = null
+            remember(fix)
             return fix
         }
+        remember(fix)
         val spot = held
         if (spot != null) {
-            // A clearly better fix, or the regular refresh, moves the spot.
-            val better = accuracyOf(fix) <= accuracyOf(spot) * 0.67f
-            val due = nowMs - heldSinceMs >= REFRESH_REST_EVERY_MS && accuracyOf(fix) <= accuracyOf(spot)
-            if (better || due) {
+            // The regular refresh: the spot moves to where the phone
+            // says it is now.
+            if (nowMs - heldSinceMs >= REFRESH_REST_EVERY_MS) {
                 rest(fix, nowMs)
                 return fix
             }
-            if (fix.distanceTo(spot) <= slack(fix, speedKnown)) {
-                return Location(fix).apply {
-                    latitude = spot.latitude
-                    longitude = spot.longitude
-                    speed = 0f
-                    if (spot.hasBearing()) bearing = spot.bearing else removeBearing()
-                }
+            // Further than wander explains, or the fixes have set off in
+            // a line: they have moved.
+            if (fix.distanceTo(spot) > slack(fix, speedKnown) || goingSomewhere()) {
+                held = null
+                return fix
             }
-            // Further than wander explains: they have moved.
-            moving()
-            recent.add(fix)
-            return fix
+            return Location(fix).apply {
+                latitude = spot.latitude
+                longitude = spot.longitude
+                speed = 0f
+                if (spot.hasBearing()) bearing = spot.bearing else removeBearing()
+            }
         }
         // Not at rest. Every fix passes; the only question is whether
-        // this one shows the driver has stopped.
+        // this one shows the driver has stopped. A slow speed reading is
+        // not enough while the fixes themselves run on down the road.
+        if (goingSomewhere()) return fix
         if (speedKnown) {
             // The phone measures speed and says "not moving".
             rest(fix, nowMs)
-            return fix
-        }
-        recent.add(fix)
-        if (recent.size > QUIET_FIXES_TO_REST) recent.removeAt(0)
-        if (recent.size == QUIET_FIXES_TO_REST) {
-            val first = recent.first()
-            if (recent.all { it.distanceTo(first) <= slack(fix, speedKnown) }) rest(fix, nowMs)
+        } else if (window.size >= QUIET_FIXES_TO_REST) {
+            // No speed reading at all: only where the fixes land. Several
+            // in a row that stay together is a phone going nowhere.
+            val first = window.first()
+            val reach = slack(fix, speedKnown)
+            if (window.all { it.distanceTo(first) <= reach }) rest(fix, nowMs)
         }
         return fix
     }
 
-    private fun moving() {
-        held = null
-        recent.clear()
+    private fun remember(fix: Location) {
+        window.add(fix)
+        if (window.size > WINDOW_FIXES) window.removeAt(0)
     }
 
     private fun rest(fix: Location, nowMs: Long) {
         held = fix
         heldSinceMs = nowMs
-        recent.clear()
     }
 
-    private fun accuracyOf(fix: Location): Float = if (fix.hasAccuracy()) fix.accuracy else Float.MAX_VALUE
+    /**
+     * Whether the latest fixes are those of a driver on the move: enough
+     * ground covered between them, and most of it in one direction.
+     * Judged from where the fixes land, so it holds when the phone's
+     * speed reads slow, or is missing, while the driver is moving.
+     */
+    private fun goingSomewhere(): Boolean {
+        if (window.size < FIXES_TO_SHOW_TRAVEL) return false
+        var path = 0f
+        for (index in 1 until window.size) path += window[index - 1].distanceTo(window[index])
+        if (path < TRAVEL_PATH_M) return false
+        return window.first().distanceTo(window.last()) / path >= TRAVEL_STRAIGHTNESS
+    }
 
     /**
      * How far a fix may land from the spot and still count as the same
-     * spot. A phone that says "not moving" is believed over a wide
-     * margin: its speed is measured, its position is the part that
-     * wanders. With no speed at all there is less to go on, so less is
-     * forgiven.
+     * spot: twice its own error, within bounds. With a speed reading the
+     * bounds are tight, so a driver crawling under walking pace is never
+     * left far behind; without one there is only position to go on.
      */
     private fun slack(fix: Location, speedKnown: Boolean): Float {
         val accuracy = if (fix.hasAccuracy()) fix.accuracy else 0f
-        return if (speedKnown) min(max(accuracy * 3, 30f), 75f) else min(max(accuracy * 2, 10f), 40f)
+        return if (speedKnown) min(max(accuracy * 2, 15f), 30f) else min(max(accuracy * 2, 10f), 40f)
     }
 }

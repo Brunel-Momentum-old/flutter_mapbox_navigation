@@ -10,7 +10,10 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.location.Location
+import android.util.Log
 import android.view.Gravity
+import com.mapbox.geojson.Feature
+import com.mapbox.geojson.FeatureCollection
 import com.mapbox.geojson.LineString
 import com.mapbox.geojson.Point
 import com.mapbox.maps.CameraOptions
@@ -25,7 +28,9 @@ import com.mapbox.maps.extension.style.layers.addLayerBelow
 import com.mapbox.maps.extension.style.layers.generated.lineLayer
 import com.mapbox.maps.extension.style.layers.properties.generated.LineCap
 import com.mapbox.maps.extension.style.sources.addSource
+import com.mapbox.maps.extension.style.sources.generated.GeoJsonSource
 import com.mapbox.maps.extension.style.sources.generated.geoJsonSource
+import com.mapbox.maps.extension.style.sources.getSourceAs
 import com.mapbox.maps.extension.style.layers.generated.symbolLayer
 import com.mapbox.maps.plugin.LocationPuck2D
 import com.mapbox.maps.plugin.animation.MapAnimationOptions
@@ -40,7 +45,11 @@ import com.mapbox.maps.plugin.annotation.generated.PolygonAnnotationOptions
 import com.mapbox.maps.plugin.annotation.generated.createPointAnnotationManager
 import com.mapbox.maps.plugin.annotation.generated.createPolygonAnnotationManager
 import com.mapbox.maps.extension.style.layers.properties.generated.IconAnchor
+import com.mapbox.maps.extension.style.layers.properties.generated.IconRotationAlignment
 import com.mapbox.navigation.dropin.NavigationView
+import com.mapbox.navigation.ui.maps.camera.NavigationCamera
+import com.mapbox.navigation.ui.maps.camera.data.MapboxNavigationViewportDataSource
+import com.mapbox.navigation.ui.maps.camera.lifecycle.NavigationBasicGesturesHandler
 import com.mapbox.navigation.ui.maps.building.api.MapboxBuildingsApi
 import com.mapbox.navigation.ui.maps.building.model.MapboxBuildingHighlightOptions
 import com.mapbox.navigation.ui.maps.building.view.MapboxBuildingView
@@ -48,6 +57,8 @@ import com.mapbox.navigation.ui.maps.puck.LocationPuckOptions
 import com.mapbox.navigation.ui.maps.route.line.model.MapboxRouteLineOptions
 import com.mapbox.navigation.ui.maps.route.line.model.RouteLineColorResources
 import com.mapbox.navigation.ui.maps.route.line.model.RouteLineResources
+import com.mapbox.turf.TurfConstants
+import com.mapbox.turf.TurfMeasurement
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
@@ -72,7 +83,14 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val BUILDING_FILL = Color.parseColor("#BFDCCB")
         val INK = Color.parseColor("#2B2B2B")
         val LEFT_ROUTE = Color.parseColor("#8E8B83")
+        /** As close as the following camera comes at a turn; iOS uses the same. */
+        private const val CLOSEST_FOLLOWING_ZOOM = 18.75
         private const val LEFT_ROUTE_ID = "host-left-route"
+        private const val TRAFFIC_LIGHT_ID = "host-traffic-lights"
+        private const val FASTER_ROUTE_ID = "host-faster-route"
+        private const val FASTER_ROUTE_CASING_ID = "host-faster-route-casing"
+        val TIP = Color.parseColor("#1E1E1C")
+        val TIP_GREEN = Color.parseColor("#1F5A37")
 
         // Every layer the SDK draws a route with starts with this.
         private const val ROUTE_LAYER_PREFIX = "mapbox-layerGroup-"
@@ -81,6 +99,9 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         /** Clear of the host's Sound and Route buttons on the right. */
         private const val ORNAMENT_RIGHT_DP = 96f
 
+        // The layer the SDK draws the driver's marker in.
+        private const val PUCK_LAYER = "mapbox-location-indicator-layer"
+
         // The route line goes under the first of these the style has: under
         // street names where it can, and under the puck whatever happens.
         // Left to itself it was drawn last, on top of the puck.
@@ -88,7 +109,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             "road-label-navigation",
             "road-label",
             "road-label-simple",
-            "mapbox-location-indicator-layer",
+            PUCK_LAYER,
         )
     }
 
@@ -130,6 +151,9 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     }
 
     val isDoorView: Boolean get() = doorEnabled
+
+    /** Where the host says the stop is, while the door view is on. */
+    val doorTarget: Point? get() = doorPoint
 
     /** Route line colours and the puck. Call before guidance starts. */
     fun applyStyle() {
@@ -188,6 +212,8 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         // A new style drops the layers this class added.
         if (doorEnabled) addHouseNumbers()
         if (routeLook != "normal") applyRouteLook(style)
+        applyTrafficLights(style)
+        applyFasterRoute(style)
     }
 
     fun onMapAttached(view: MapView) {
@@ -196,6 +222,12 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         pinManager = null
         doorPointManager = null
         doorPolygonManager = null
+        tagManager = null
+        shownTurnTag = ""
+        shownFasterTips = ""
+        destinationPinManager = null
+        shownDestinationPin = ""
+        followCameraTuned = false
         placeOrnaments()
         view.getMapboxMap().addOnStyleLoadedListener(styleLoaded)
         view.getMapboxMap().getStyle { onStyle(it) }
@@ -287,6 +319,216 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     fun onCameraState(state: String) {
         overview = state == "overview"
         refreshPins()
+        refreshTags()
+        refreshDestinationPin()
+    }
+
+    // ---- traffic lights -----------------------------------------------
+
+    private var trafficLights: List<Point> = emptyList()
+
+    /** Where the route in use passes a traffic light. */
+    fun setTrafficLights(points: List<Point>) {
+        if (points == trafficLights) return
+        trafficLights = points
+        mapView?.getMapboxMap()?.getStyle { applyTrafficLights(it) }
+    }
+
+    private fun applyTrafficLights(style: Style) {
+        val lights = FeatureCollection.fromFeatures(trafficLights.map { Feature.fromGeometry(it) })
+        style.getSourceAs<GeoJsonSource>(TRAFFIC_LIGHT_ID)?.let {
+            it.featureCollection(lights)
+            return
+        }
+        if (trafficLights.isEmpty()) return
+        style.addImage(TRAFFIC_LIGHT_ID, trafficLightBitmap())
+        style.addSource(geoJsonSource(TRAFFIC_LIGHT_ID) { featureCollection(lights) })
+        val layer = symbolLayer(TRAFFIC_LIGHT_ID, TRAFFIC_LIGHT_ID) {
+            iconImage(TRAFFIC_LIGHT_ID)
+            iconAllowOverlap(true)
+            // Only close enough to matter: a route's worth of lights
+            // at city zoom is confetti.
+            minZoom(15.5)
+        }
+        // Under the driver's marker where there is one. Added last, a
+        // light was drawn over the driver waiting at it.
+        if (style.styleLayerExists(PUCK_LAYER)) style.addLayerBelow(layer, PUCK_LAYER) else style.addLayer(layer)
+    }
+
+    // ---- tags on the map: the next turn, and a faster route -----------
+
+    private var tagManager: PointAnnotationManager? = null
+    private var turnTag: Pair<Point, String>? = null
+    private var shownTurnTag = ""
+    private var fasterRoute: LineString? = null
+    private var fasterTips: List<Pair<Point, String>> = emptyList()
+    private var shownFasterTips = ""
+
+    /** The street the next turn goes onto, tagged at the turn. Null for none. */
+    fun setTurnTag(point: Point?, street: String?) {
+        turnTag = if (point == null || street.isNullOrBlank()) null else point to street
+        refreshTags()
+    }
+
+    private var destinationPinManager: PointAnnotationManager? = null
+    private var destinationPin: Pair<Point, Double?>? = null
+    private var shownDestinationPin = ""
+
+    /**
+     * Marks the end of the route with a pin whose arrow points at the
+     * stop. The route ends on the road; the stop is a house or a door to
+     * one side of it, and which side is the first thing the driver needs
+     * to know as they pull up. [bearing] is the compass direction from
+     * [road] to the stop, null when nothing says. A null [road] takes the
+     * pin off.
+     */
+    fun setDestinationPin(road: Point?, bearing: Double?) {
+        destinationPin = road?.let { it to bearing }
+        refreshDestinationPin()
+    }
+
+    private fun refreshDestinationPin() {
+        val view = mapView ?: return
+        // The overview has the numbered pins.
+        val pin = destinationPin?.takeIf { !overview }
+        val key = pin?.let {
+            "${it.first.latitude()},${it.first.longitude()},${it.second?.let { b -> Math.round(b) } ?: "-"}"
+        }.orEmpty()
+        if (key == shownDestinationPin) return
+        shownDestinationPin = key
+        val manager = destinationPinManager ?: view.annotations.createPointAnnotationManager().also {
+            // The arrow is a direction on the ground: it turns with the
+            // map, and nothing may hide it.
+            it.iconRotationAlignment = IconRotationAlignment.MAP
+            it.iconAllowOverlap = true
+            it.iconIgnorePlacement = true
+            destinationPinManager = it
+        }
+        manager.deleteAll()
+        if (pin == null) return
+        manager.create(
+            PointAnnotationOptions().withPoint(pin.first)
+                .withIconImage(destinationPinBitmap(pointing = pin.second != null))
+                .withIconRotate(pin.second ?: 0.0)
+        )
+    }
+
+    /**
+     * A dark disc with a white ring; [pointing] adds a white arrow, tip
+     * up, to be turned towards the stop.
+     */
+    private fun destinationPinBitmap(pointing: Boolean): Bitmap {
+        val u = density
+        val diameter = 40f * u
+        val size = (diameter + 4f * u).toInt()
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val c = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = TIP
+        canvas.drawCircle(c, c, diameter / 2f, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f * u
+        paint.color = Color.WHITE
+        canvas.drawCircle(c, c, diameter / 2f - 1.5f * u, paint)
+        paint.style = Paint.Style.FILL
+        if (!pointing) {
+            canvas.drawCircle(c, c, 5f * u, paint)
+            return bitmap
+        }
+        val arrow = Path().apply {
+            moveTo(c, c - 13f * u)
+            lineTo(c + 10f * u, c - u)
+            lineTo(c + 3.5f * u, c - u)
+            lineTo(c + 3.5f * u, c + 12f * u)
+            lineTo(c - 3.5f * u, c + 12f * u)
+            lineTo(c - 3.5f * u, c - u)
+            lineTo(c - 10f * u, c - u)
+            close()
+        }
+        canvas.drawPath(arrow, paint)
+        return bitmap
+    }
+
+    /**
+     * A faster route on offer: the part of it that leaves the route in
+     * use, in green, with "N min faster" on it and "Yours" on the route
+     * in use. Null takes it off again.
+     */
+    fun setFasterRoute(branch: LineString?, minutes: Int, yours: Point?) {
+        fasterRoute = branch
+        fasterTips = if (branch == null) emptyList() else listOfNotNull(
+            pointAlong(branch, 0.4)?.let { it to "$minutes min faster" },
+            yours?.let { it to "Yours" },
+        )
+        mapView?.getMapboxMap()?.getStyle { applyFasterRoute(it) }
+        refreshTags()
+    }
+
+    private fun applyFasterRoute(style: Style) {
+        for (id in listOf(FASTER_ROUTE_ID, FASTER_ROUTE_CASING_ID)) {
+            if (style.styleLayerExists(id)) style.removeStyleLayer(id)
+        }
+        if (style.styleSourceExists(FASTER_ROUTE_ID)) style.removeStyleSource(FASTER_ROUTE_ID)
+        val branch = fasterRoute ?: return
+        style.addSource(geoJsonSource(FASTER_ROUTE_ID) { geometry(branch) })
+        val anchor = ROUTE_LINE_ANCHORS.firstOrNull { style.styleLayerExists(it) }
+        val casing = lineLayer(FASTER_ROUTE_CASING_ID, FASTER_ROUTE_ID) {
+            lineColor(Color.WHITE)
+            lineWidth(12.0)
+            lineCap(LineCap.ROUND)
+        }
+        val line = lineLayer(FASTER_ROUTE_ID, FASTER_ROUTE_ID) {
+            lineColor(GREEN)
+            lineWidth(7.0)
+            lineCap(LineCap.ROUND)
+        }
+        if (anchor != null) {
+            style.addLayerBelow(casing, anchor)
+            style.addLayerBelow(line, anchor)
+        } else {
+            style.addLayer(casing)
+            style.addLayer(line)
+        }
+    }
+
+    /** One manager for both kinds of tag, so they stack predictably. */
+    private fun refreshTags() {
+        val view = mapView ?: return
+        // The door view has the stop's own marking; the turn tag would
+        // sit on top of it. The faster route's tags are for the overview
+        // the host switches to when it offers one, and stay in any view.
+        val turn = turnTag?.takeIf { !doorEnabled && !overview && fasterRoute == null }
+        val turnKey = turn?.let { "${it.first.latitude()},${it.first.longitude()},${it.second}" }.orEmpty()
+        val tipsKey = fasterTips.joinToString(";") { "${it.first.latitude()},${it.first.longitude()},${it.second}" }
+        if (turnKey == shownTurnTag && tipsKey == shownFasterTips) return
+        shownTurnTag = turnKey
+        shownFasterTips = tipsKey
+        val manager = tagManager ?: view.annotations.createPointAnnotationManager().also { tagManager = it }
+        manager.deleteAll()
+        if (turn != null) {
+            manager.create(
+                PointAnnotationOptions().withPoint(turn.first)
+                    .withIconImage(tagBitmap(turn.second, TIP, pointer = true))
+                    .withIconAnchor(IconAnchor.BOTTOM)
+                    .withIconOffset(listOf(0.0, -8.0))
+            )
+        }
+        for ((point, text) in fasterTips) {
+            manager.create(
+                PointAnnotationOptions().withPoint(point)
+                    .withIconImage(tagBitmap(text, if (text == "Yours") TIP else TIP_GREEN, pointer = false))
+                    .withSymbolSortKey(if (text == "Yours") 0.0 else 1.0)
+            )
+        }
+    }
+
+    /** The point [fraction] of the way along [line]. */
+    private fun pointAlong(line: LineString, fraction: Double): Point? {
+        val coordinates = line.coordinates()
+        if (coordinates.size < 2) return coordinates.firstOrNull()
+        val length = TurfMeasurement.length(line, TurfConstants.UNIT_METERS)
+        return TurfMeasurement.along(line, length * fraction, TurfConstants.UNIT_METERS)
     }
 
     private fun refreshPins() {
@@ -341,21 +583,94 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         if (entering) {
             addHouseNumbers()
             refreshPins()
+            refreshTags()
         }
     }
 
     fun leaveDoorView() {
         if (!doorEnabled) return
         doorEnabled = false
+        // The building's marking goes with the view. Coming back for the
+        // same stop has to look for the building again, or it marks
+        // nothing.
+        footprintFound = false
+        highlightAttempts = 0
         mapView?.getMapboxMap()?.getStyle { buildingView.removeBuildingHighlight(it, highlightOptions) }
         doorPointManager?.deleteAll()
         doorPolygonManager?.deleteAll()
         refreshPins()
+        refreshTags()
     }
 
-    /** Runs on every location update while the door view is on. */
+    // ---- heading up ---------------------------------------------------
+
+    private var followCameraTuned = false
+
+    /**
+     * Heading up, always, with the driver's marker in one place.
+     *
+     * By default the camera looks towards the next turn, up to 45 degrees
+     * off the way the driver is going, so on a curving road the marker's
+     * arrow swung round while the map stayed put; and near a turn it
+     * flattened and slid over to frame the turn, taking the marker off its
+     * spot. Drop-In keeps the camera's settings to itself, so they are
+     * reached through the objects that hold them, found by type (names do
+     * not survive a release build). If the SDK ever moves them this does
+     * nothing and the camera behaves as the SDK ships it.
+     */
+    private fun tuneFollowCamera() {
+        if (followCameraTuned) return
+        val view = mapView ?: return
+        try {
+            val plugin: Any = view.camera
+            val handler = valuesIn(plugin).filterIsInstance<Iterable<*>>()
+                .flatMap { it.toList() }
+                .firstOrNull { it is NavigationBasicGesturesHandler } ?: return
+            val camera = valuesIn(handler).firstOrNull { it is NavigationCamera } ?: return
+            val viewport = valuesIn(camera).filterIsInstance<MapboxNavigationViewportDataSource>()
+                .firstOrNull() ?: return
+            viewport.options.followingFrameOptions.bearingSmoothing.enabled = false
+            viewport.options.followingFrameOptions.pitchNearManeuvers.enabled = false
+            // The camera closes in as a turn comes up, but the SDK stops
+            // it where the screen still shows 600 m; 30 m from a junction
+            // the lanes and the turn were a few pixels across.
+            viewport.options.followingFrameOptions.maxZoom = CLOSEST_FOLLOWING_ZOOM
+            viewport.evaluate()
+            followCameraTuned = true
+        } catch (e: Exception) {
+            followCameraTuned = true
+            Log.w("MapLook", "follow camera left as the SDK ships it: $e")
+        }
+    }
+
+    /** The values of every field [target] declares, however private. */
+    private fun valuesIn(target: Any): List<Any> {
+        val values = ArrayList<Any>()
+        var type: Class<*>? = target.javaClass
+        while (type != null && type != Any::class.java) {
+            for (field in type.declaredFields) {
+                try {
+                    field.isAccessible = true
+                    field.get(target)?.let { values.add(it) }
+                } catch (_: Exception) {
+                    // A field that will not be read is not the one wanted.
+                }
+            }
+            type = type.superclass
+        }
+        return values
+    }
+
+    /** Runs on every location update. */
     fun onLocation(location: Location) {
+        tuneFollowCamera()
         if (!doorEnabled) return
+        // The overview the driver asked for stays up until they
+        // re-centre. Moving the camera back to the door on every fix
+        // took it away again within a second. The building is not looked
+        // for meanwhile either: from that far out it cannot be found, and
+        // the tries are few.
+        if (overview) return
         val view = mapView ?: return
         val padding = hostPadding ?: EdgeInsets(0.0, 0.0, 0.0, 0.0)
         val height = view.height.toDouble()
@@ -562,6 +877,63 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             canvas.drawRoundRect(rect, dp(8f), dp(8f), paint)
             paint.color = INK
             canvas.drawText(tag, rect.centerX(), rect.centerY() - (paint.descent() + paint.ascent()) / 2, paint)
+        }
+        return bitmap
+    }
+
+    /** A dark or green rounded tag with white text; [pointer] adds a tail pointing down. */
+    private fun tagBitmap(text: String, fill: Int, pointer: Boolean): Bitmap {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textSize = dp(if (pointer) 14f else 16f)
+        paint.textAlign = Paint.Align.CENTER
+        val width = paint.measureText(text) + dp(24f)
+        val height = dp(if (pointer) 31f else 36f)
+        val tail = if (pointer) dp(9f) else 0f
+        val bitmap = Bitmap.createBitmap(
+            (width + dp(4f)).toInt(),
+            (height + tail + dp(4f)).toInt(),
+            Bitmap.Config.ARGB_8888,
+        )
+        val canvas = Canvas(bitmap)
+        val rect = RectF(dp(2f), dp(2f), dp(2f) + width, dp(2f) + height)
+        paint.color = fill
+        canvas.drawRoundRect(rect, dp(if (pointer) 9f else 12f), dp(if (pointer) 9f else 12f), paint)
+        if (pointer) {
+            canvas.drawPath(
+                Path().apply {
+                    moveTo(rect.centerX() - dp(8f), rect.bottom - 1)
+                    lineTo(rect.centerX(), rect.bottom + tail)
+                    lineTo(rect.centerX() + dp(8f), rect.bottom - 1)
+                    close()
+                },
+                paint,
+            )
+        }
+        paint.color = Color.WHITE
+        canvas.drawText(text, rect.centerX(), rect.centerY() - (paint.descent() + paint.ascent()) / 2, paint)
+        return bitmap
+    }
+
+    /** A signal head: dark, white-edged, red over amber over green. */
+    private fun trafficLightBitmap(): Bitmap {
+        val width = dp(17f)
+        val height = dp(38f)
+        val bitmap = Bitmap.createBitmap((width + dp(4f)).toInt(), (height + dp(4f)).toInt(), Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val rect = RectF(dp(2f), dp(2f), dp(2f) + width, dp(2f) + height)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.color = TIP
+        canvas.drawRoundRect(rect, dp(6f), dp(6f), paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(2f)
+        paint.color = Color.WHITE
+        canvas.drawRoundRect(rect, dp(6f), dp(6f), paint)
+        paint.style = Paint.Style.FILL
+        val lamps = listOf("#E5483A", "#F0A91B", "#3BB273")
+        for ((index, lamp) in lamps.withIndex()) {
+            paint.color = Color.parseColor(lamp)
+            canvas.drawCircle(rect.centerX(), rect.top + dp(9f) + index * dp(10f), dp(3.8f), paint)
         }
         return bitmap
     }

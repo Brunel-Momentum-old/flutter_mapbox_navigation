@@ -53,9 +53,10 @@ import com.mapbox.turf.TurfMisc
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
+import kotlin.math.roundToInt
 
 /** How much faster an alternative has to be before it is offered. */
-private const val FASTER_ROUTE_MIN_SAVING_S = 120.0
+private const val DEFAULT_FASTER_ROUTE_MIN_SAVING_S = 120.0
 
 /** Map kept clear between the host's sheet and the centre of the puck. */
 private const val PUCK_CLEARANCE_DP = 72f
@@ -81,11 +82,13 @@ open class TurnByTurn(
     }
 
     open fun initNavigation() {
+        val engine = SteadyLocationEngine(LocationEngineProvider.getBestLocationEngine(this.context))
+        this.locationEngine = engine
         val navigationOptions = NavigationOptions.Builder(this.context)
             .accessToken(this.token)
             // Fixes that wander while the driver stands still are held
             // in place before the navigator sees them.
-            .locationEngine(SteadyLocationEngine(LocationEngineProvider.getBestLocationEngine(this.context)))
+            .locationEngine(engine)
             .build()
 
         MapboxNavigationApp
@@ -135,6 +138,11 @@ open class TurnByTurn(
             }
             "showOverview" -> {
                 SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Overview))
+                // Said here and now, not when Drop-In gets round to
+                // reporting it: the door view moves the camera on the
+                // next fix unless it already knows the overview is up,
+                // and any move of its own ends the overview.
+                this.sendCameraState("overview")
                 result.success(true)
             }
             "recenter", "reCenter" -> {
@@ -177,13 +185,23 @@ open class TurnByTurn(
                     methodCall.argument<Double>("longitude"),
                     methodCall.argument<String>("label"),
                 )
-                if (enabled && !wasOn) {
+                // The overview the driver asked for outlasts the door view
+                // coming and going. It is theirs to leave, by re-centring;
+                // only then does the door view, if it is on, take the camera.
+                val overviewUp = this.cameraState == "overview"
+                if (enabled && !wasOn && !overviewUp) {
                     // The door view drives the camera by hand.
                     SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Idle))
                     this.lastLocation?.let { this.mapLook.onLocation(it) }
-                } else if (!enabled && wasOn) {
+                } else if (!enabled && wasOn && !overviewUp) {
                     SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Following))
                 }
+                result.success(true)
+            }
+            "setFasterRouteMinimumSaving" -> {
+                this.fasterRouteMinSavingS =
+                    methodCall.argument<Double>("seconds") ?: DEFAULT_FASTER_ROUTE_MIN_SAVING_S
+                this.emitNavState()
                 result.success(true)
             }
             "setRouteLook" -> {
@@ -342,6 +360,18 @@ open class TurnByTurn(
             PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
             return
         }
+        // Whatever route the shared navigation object still holds from a
+        // trip before this one is not this trip's to report on.
+        val mine = this.currentRoutes!!.map { it.id }.toSet()
+        this.leftoverRouteIds = this.activeRoutes.map { it.id }.toSet() - mine
+        this.lastProgress = null
+        this.guidanceStarted = true
+        // The host fades the route while it re-targets and takes it to be
+        // back to normal once guidance has started. The SDK draws the new
+        // route into the layers it already has, faded ones included.
+        this.mapLook.setRouteLook("normal", null)
+        // And the last trip's stop is not this one's.
+        this.mapLook.setDestinationPin(null, null)
         this.binding.navigationView.api.startActiveGuidance(this.currentRoutes!!)
         PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_RUNNING)
     }
@@ -349,6 +379,13 @@ open class TurnByTurn(
     private fun finishNavigation(isOffRouted: Boolean = false) {
         // Null-safe: finishing before Drop-In initialised used to NPE.
         MapboxNavigationApp.current()?.stopTripSession()
+        // The navigation object is shared and outlives this view. Left
+        // with this trip's route, it handed the next trip's view this
+        // trip's progress until that one's own route was in.
+        MapboxNavigationApp.current()?.setNavigationRoutes(emptyList())
+        // No route, no progress to say the tunnel has ended.
+        this.locationEngine?.inTunnel = false
+        this.guidanceStarted = false
         this.isNavigationCanceled = true
         PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
     }
@@ -490,6 +527,10 @@ open class TurnByTurn(
     open var eventChannel: EventChannel? = null
     private var lastLocation: Location? = null
 
+    /// The location engine the navigator was set up with, kept so it can
+    /// be told when the route has the driver in a tunnel.
+    private var locationEngine: SteadyLocationEngine? = null
+
     /**
      * Helper class that keeps added waypoints and transforms them to the [RouteOptions] params.
      */
@@ -526,6 +567,10 @@ open class TurnByTurn(
     private var currentRoutes: List<NavigationRoute>? = null
     private var isNavigationCanceled = false
 
+    /// Set once this view has started guidance on a route of its own.
+    private var guidanceStarted = false
+    private var leftoverRouteIds: Set<String> = emptySet()
+
     // State behind the nav_state event.
     private var lastProgress: RouteProgress? = null
     private var activeRoutes: List<NavigationRoute> = emptyList()
@@ -540,6 +585,11 @@ open class TurnByTurn(
     private var hostPadding: EdgeInsets? = null
     private val declinedAlternativeIds = mutableSetOf<String>()
     private var fasterRouteSaving: Double? = null
+
+    /// How much faster an alternative has to be before it is offered.
+    /// The host may change it (`setFasterRouteMinimumSaving`).
+    private var fasterRouteMinSavingS = DEFAULT_FASTER_ROUTE_MIN_SAVING_S
+    private var fasterRouteOnMap: String? = null
     private var nightMode = false
 
     /** Route line, puck, stop pins and the door view. */
@@ -589,6 +639,7 @@ open class TurnByTurn(
 
     private val routesObserver = RoutesObserver { routeUpdateResult ->
         this.activeRoutes = routeUpdateResult.navigationRoutes
+        this.mapLook.setTrafficLights(this.trafficLightsOn(routeUpdateResult.navigationRoutes.firstOrNull()))
         if (routeUpdateResult.navigationRoutes.isNotEmpty()) {
             PluginUtilities.sendEvent(MapBoxEvents.REROUTE_ALONG);
         }
@@ -666,6 +717,86 @@ open class TurnByTurn(
         }
     }
 
+    /** Draws the faster route on offer, or takes it off when the offer has gone. */
+    private fun showFasterRouteOnMap(faster: NavigationRoute?) {
+        if (faster?.id == this.fasterRouteOnMap) return
+        this.fasterRouteOnMap = faster?.id
+        val navigation = MapboxNavigationApp.current()
+        val metadata = faster?.let { navigation?.getAlternativeMetadataFor(it) }
+        val geometry = faster?.directionsRoute?.geometry()
+        if (faster == null || metadata == null || geometry == null) {
+            this.mapLook.setFasterRoute(null, 0, null)
+            return
+        }
+        // Only where it leaves the route in use: the shared stretch stays
+        // the colour of the route the driver is on.
+        val whole = LineString.fromPolyline(geometry, 6)
+        val fork = metadata.forkIntersectionOfAlternativeRoute.location
+        val branch = TurfMisc.lineSlice(fork, whole.coordinates().last(), whole)
+        val yours = this.activeRoutes.firstOrNull()?.directionsRoute?.geometry()?.let {
+            val mine = LineString.fromPolyline(it, 6)
+            val rest = TurfMisc.lineSlice(
+                metadata.forkIntersectionOfPrimaryRoute.location, mine.coordinates().last(), mine)
+            TurfMeasurement.along(
+                rest, TurfMeasurement.length(rest, TurfConstants.UNIT_METERS) * 0.4, TurfConstants.UNIT_METERS)
+        }
+        val minutes = ((this.fasterRouteSaving ?: 0.0) / 60.0).roundToInt().coerceAtLeast(1)
+        this.mapLook.setFasterRoute(branch, minutes, yours)
+    }
+
+    /**
+     * The end of the route, marked on the last stretch and in the door
+     * view with a pin that points at the stop: from the two points when
+     * they are far enough apart to tell, otherwise from the side the
+     * directions give for the arrival.
+     */
+    private fun markDestination(progress: RouteProgress) {
+        val leg = progress.currentLegProgress
+        val last = leg?.routeLeg?.steps()?.lastOrNull()?.maneuver()
+        val arriving = leg?.upcomingStep?.maneuver()?.type() == "arrive" || this.mapLook.isDoorView
+        if (last == null || !arriving) {
+            this.mapLook.setDestinationPin(null, null)
+            return
+        }
+        val road = last.location()
+        val stop = this.mapLook.doorTarget
+            ?: progress.navigationRoute.routeOptions.coordinatesList().lastOrNull()
+        var bearing: Double? = null
+        if (stop != null && TurfMeasurement.distance(road, stop, TurfConstants.UNIT_METERS) >= 4.0) {
+            bearing = (TurfMeasurement.bearing(road, stop) + 360.0) % 360.0
+        } else {
+            val heading = last.bearingBefore()
+            val side = last.modifier().orEmpty()
+            if (heading != null && side.contains("left")) bearing = (heading + 270.0) % 360.0
+            if (heading != null && side.contains("right")) bearing = (heading + 90.0) % 360.0
+        }
+        this.mapLook.setDestinationPin(road, bearing)
+    }
+
+    /** The street the next turn goes onto, tagged at the turn on the map. */
+    private fun tagNextTurn(progress: RouteProgress) {
+        val step = progress.currentLegProgress?.upcomingStep
+        val maneuver = step?.maneuver()
+        val street = progress.bannerInstructions?.primary()?.text()
+        // Arriving is not a turn: the door view marks the stop itself.
+        if (maneuver == null || maneuver.type() == "arrive") {
+            this.mapLook.setTurnTag(null, null)
+        } else {
+            this.mapLook.setTurnTag(maneuver.location(), street ?: step.name())
+        }
+    }
+
+    /** Where the route in use passes a traffic light. */
+    private fun trafficLightsOn(route: NavigationRoute?): List<Point> {
+        val lights = ArrayList<Point>()
+        route?.directionsRoute?.legs()?.forEach { leg ->
+            leg.steps()?.forEach { step ->
+                step.intersections()?.forEach { if (it.trafficSignal() == true) lights.add(it.location()) }
+            }
+        }
+        return lights
+    }
+
     /** The part of the route in use that the driver has not driven yet. */
     private fun routeStillAhead(): LineString? {
         val geometry = this.activeRoutes.firstOrNull()?.directionsRoute?.geometry() ?: return null
@@ -683,7 +814,7 @@ open class TurnByTurn(
         if (routes.size < 2) return null
         val primaryDuration = routes.first().directionsRoute.duration()
         var best: NavigationRoute? = null
-        var bestSaving = FASTER_ROUTE_MIN_SAVING_S
+        var bestSaving = this.fasterRouteMinSavingS
         for (route in routes.drop(1)) {
             if (this.declinedAlternativeIds.contains(route.id)) continue
             val metadata = navigation.getAlternativeMetadataFor(route) ?: continue
@@ -713,7 +844,7 @@ open class TurnByTurn(
     private fun emitNavState() {
         if (this.isNavigationCanceled) return
         val progress = this.lastProgress ?: return
-        try {
+        val faster: NavigationRoute? = try {
             val state = JSONObject()
             state.put("distanceRemaining", progress.distanceRemaining.toDouble())
             state.put("durationRemaining", progress.durationRemaining)
@@ -783,24 +914,57 @@ open class TurnByTurn(
                 if (it.hasSpeed()) state.put("speed", it.speed.toDouble())
             }
 
-            if (!this.offRoute && !this.rerouting && this.fasterAlternative() != null) {
+            val offered = if (!this.offRoute && !this.rerouting) this.fasterAlternative() else null
+            if (offered != null) {
                 this.fasterRouteSaving?.let {
                     state.put("fasterRoute", JSONObject().put("savingSeconds", it))
                 }
             }
 
             PluginUtilities.sendEvent(MapBoxEvents.NAV_STATE, state.toString())
+            offered
         } catch (_: java.lang.Exception) {
             // A state that fails to encode is skipped, never fatal.
+            return
         }
+        // What the map shows for this state is drawn once the state has
+        // gone out. Drawn first, a route that would not slice took the
+        // whole tick's state down with it.
+        try {
+            this.showFasterRouteOnMap(faster)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the faster route", e)
+        }
+        try {
+            this.tagNextTurn(progress)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the next turn's tag", e)
+        }
+        try {
+            this.markDestination(progress)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the pin at the stop", e)
+        }
+    }
+
+    /// What has already failed to draw: a fault that comes back on every
+    /// tick is logged the first time only.
+    private val drawingFailuresLogged = mutableSetOf<String>()
+
+    private fun logDrawingFailureOnce(what: String, error: java.lang.Exception) {
+        if (this.drawingFailuresLogged.add(what)) Log.w("TurnByTurn", "$what was not drawn: $error")
     }
 
     /**
      * Gets notified with progress along the currently active route.
      */
     private val routeProgressObserver = RouteProgressObserver { routeProgress ->
+        // Whichever route the navigator is carrying the driver along,
+        // the location engine has to know when it runs through a tunnel.
+        this.locationEngine?.inTunnel = routeProgress.inTunnel
         // update flutter events
-        if (!this.isNavigationCanceled) {
+        if (!this.isNavigationCanceled && this.guidanceStarted &&
+            routeProgress.navigationRoute.id !in this.leftoverRouteIds) {
             try {
 
                 this.distanceRemaining = routeProgress.distanceRemaining
