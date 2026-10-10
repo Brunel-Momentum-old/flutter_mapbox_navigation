@@ -35,6 +35,7 @@ class MapBoxOptions {
     this.showReportFeedbackButton = true,
     this.showEndOfRouteFeedback = true,
     this.enableOnMapTapCallback = false,
+    this.progressEvents,
   });
 
   MapBoxOptions.from(MapBoxOptions option) {
@@ -58,6 +59,7 @@ class MapBoxOptions {
     mapStyleUrlNight = option.mapStyleUrlNight;
     padding = option.padding;
     animateBuildRoute = option.animateBuildRoute;
+    progressEvents = option.progressEvents;
     showReportFeedbackButton = option.showReportFeedbackButton;
     showEndOfRouteFeedback = option.showEndOfRouteFeedback;
   }
@@ -168,6 +170,12 @@ class MapBoxOptions {
   /// to where you tap on the map.
   bool? enableOnMapTapCallback;
 
+  /// Whether the native side sends a `progress_change` event on every
+  /// tick. It carries every step of the trip and is rebuilt and encoded
+  /// each second. A host that reads `nav_state` (which has the time and
+  /// distance left) sets this to false. Default: sent.
+  bool? progressEvents;
+
   Map<String, dynamic> toMap() {
     final optionsMap = <String, dynamic>{};
     void addIfNonNull(String fieldName, dynamic value) {
@@ -181,6 +189,7 @@ class MapBoxOptions {
     addIfNonNull('language', language);
     addIfNonNull('animateBuildRoute', animateBuildRoute);
     addIfNonNull('longPressDestinationEnabled', longPressDestinationEnabled);
+    addIfNonNull('progressEvents', progressEvents);
 
     if (zoom != null) optionsMap['zoom'] = zoom;
     if (bearing != null) optionsMap['bearing'] = bearing;

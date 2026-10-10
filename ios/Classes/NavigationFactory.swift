@@ -65,6 +65,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _bearing: Double = 0.0
     var _animateBuildRoute = true
     var _longPressDestinationEnabled = true
+    /// Whether a `progress_change` event goes out on every tick. It
+    /// carries every step of the trip, rebuilt and encoded each second;
+    /// a host that reads `nav_state` turns it off (`progressEvents`).
+    var _progressEvents = true
     var _alternatives = true
     var _shouldReRoute = true
     var _showReportFeedbackButton = true
@@ -97,6 +101,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _tagManager: PointAnnotationManager?
     var _destinationPinManager: PointAnnotationManager?
     var _shownDestinationPin: String?
+    var _trafficLightsDrawnAt: Date?
+    var _trafficTag: (CLLocationCoordinate2D, String)?
+    var _trafficCheckedAt: Date?
+    var _trafficCheckedFor: String?
     var _turnTag: (CLLocationCoordinate2D, String)?
     var _fasterTips: [(CLLocationCoordinate2D, String)] = []
     var _shownTags = ""
@@ -338,6 +346,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _tilt = arguments?["tilt"] as? Double ?? _tilt
         _animateBuildRoute = arguments?["animateBuildRoute"] as? Bool ?? _animateBuildRoute
         _longPressDestinationEnabled = arguments?["longPressDestinationEnabled"] as? Bool ?? _longPressDestinationEnabled
+        _progressEvents = arguments?["progressEvents"] as? Bool ?? _progressEvents
         _alternatives = arguments?["alternatives"] as? Bool ?? _alternatives
     }
     
@@ -400,6 +409,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _shownTags = ""
         _destinationPinManager = nil
         _shownDestinationPin = nil
+        _trafficLightsDrawnAt = nil
+        _trafficTag = nil
+        _trafficCheckedAt = nil
+        _trafficCheckedFor = nil
         _turnTag = nil
         _fasterTips = []
         _fasterRouteOnMap = nil
@@ -573,7 +586,7 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         _durationRemaining = progress.durationRemaining
         sendEvent(eventType: MapBoxEventType.navigation_running)
         //_currentLegDescription =  progress.currentLeg.description
-        if(_eventSink != nil && !_navigatorBehind)
+        if(_eventSink != nil && !_navigatorBehind && _progressEvents)
         {
             let jsonEncoder = JSONEncoder()
             

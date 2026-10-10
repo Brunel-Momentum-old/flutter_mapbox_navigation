@@ -130,6 +130,7 @@ extension NavigationFactory {
         _fasterRouteOnMap = nil
         _shownTags = ""
         _shownDestinationPin = nil
+        _trafficLightsDrawnAt = nil
     }
 
     // MARK: Tags on the map: the next turn, and a faster route
@@ -146,6 +147,108 @@ extension NavigationFactory {
             _turnTag = nil
         }
         refreshTags()
+    }
+
+    // MARK: Traffic lights
+
+    /// Puts our traffic light in place of the SDK's. Its housing is
+    /// pale, and a light on the route line all but vanished into it
+    /// (founder, on a drive: "the lights are blending into the
+    /// polyline"). Ours is the same three lights in a black housing with
+    /// a white edge.
+    ///
+    /// The SDK puts its own picture back whenever it restyles the map,
+    /// without saying so, so ours is set again every quarter of a minute
+    /// as well as after a change of day and night.
+    func drawTrafficLights() {
+        if let at = _trafficLightsDrawnAt, Date().timeIntervalSince(at) < 15 { return }
+        guard let style = _navigationViewController?.navigationMapView?.mapView.mapboxMap.style else { return }
+        // The SDK's name for it; the layer it draws the lights with
+        // looks the picture up by this.
+        let image = Self.trafficLightImage()
+        if (try? style.addImage(image, id: "traffic_signal")) == nil {
+            // A picture of another size will not be swapped in place.
+            try? style.removeImage(withId: "traffic_signal")
+            guard (try? style.addImage(image, id: "traffic_signal")) != nil else { return }
+        }
+        _trafficLightsDrawnAt = Date()
+    }
+
+    static func trafficLightImage() -> UIImage {
+        let size = CGSize(width: 22, height: 52)
+        return UIGraphicsImageRenderer(size: size).image { context in
+            let cg = context.cgContext
+            let housing = UIBezierPath(roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1),
+                                       cornerRadius: 7)
+            cg.setFillColor(HostMapColor.tip.cgColor)
+            housing.fill()
+            cg.setStrokeColor(UIColor.white.cgColor)
+            housing.lineWidth = 1.5
+            housing.stroke()
+            let lights: [UIColor] = [
+                UIColor(red: 0xE5 / 255.0, green: 0x48 / 255.0, blue: 0x4D / 255.0, alpha: 1),
+                UIColor(red: 0xF5 / 255.0, green: 0xB3 / 255.0, blue: 0x01 / 255.0, alpha: 1),
+                UIColor(red: 0x2F / 255.0, green: 0xA3 / 255.0, blue: 0x6B / 255.0, alpha: 1),
+            ]
+            for (index, light) in lights.enumerated() {
+                cg.setFillColor(light.cgColor)
+                cg.fillEllipse(in: CGRect(x: 5, y: 6 + CGFloat(index) * 14, width: 12, height: 12))
+            }
+        }
+    }
+
+    // MARK: Heavy traffic ahead
+
+    /// Tags the first stretch of heavy traffic ahead with what it costs:
+    /// "+3 min · Heavy traffic". The red on the line says where; this
+    /// says how much, which is what makes a driver decide.
+    ///
+    /// The delay is the leg's expected time over its typical time, so it
+    /// is only shown where the directions give both, and only from two
+    /// minutes up: less than that is not worth a driver's glance. Worked
+    /// out again when the route or the leg changes and every half
+    /// minute, not on every tick: the line is walked from the driver to
+    /// the stop each time.
+    func tagTraffic(_ progress: RouteProgress) {
+        let key = "\(ObjectIdentifier(progress.route).hashValue),\(progress.legIndex)"
+        if key == _trafficCheckedFor, let at = _trafficCheckedAt, Date().timeIntervalSince(at) < 30 { return }
+        _trafficCheckedFor = key
+        _trafficCheckedAt = Date()
+        _trafficTag = Self.heavyTraffic(ahead: progress)
+        refreshTags()
+    }
+
+    static func heavyTraffic(ahead progress: RouteProgress) -> (CLLocationCoordinate2D, String)? {
+        let leg = progress.currentLeg
+        let line = leg.shape.coordinates
+        // One level for each piece of the line, or the two cannot be
+        // matched up and nothing is said.
+        guard let typical = leg.typicalTravelTime,
+              let levels = leg.segmentCongestionLevels,
+              line.count == levels.count + 1 else { return nil }
+        let minutes = Int(((leg.expectedTravelTime - typical) / 60).rounded())
+        guard minutes >= 2 else { return nil }
+        var start: Int?
+        var length: CLLocationDistance = 0
+        let from = min(max(0, progress.currentLegProgress.shapeIndex), levels.count)
+        // One past the end, so a run that reaches the stop is closed too.
+        for index in from...levels.count {
+            let heavy = index < levels.count && (levels[index] == .heavy || levels[index] == .severe)
+            if heavy {
+                if start == nil { start = index; length = 0 }
+                length += line[index].distance(to: line[index + 1])
+                continue
+            }
+            if let first = start {
+                if length >= 100 {
+                    let run = LineString(Array(line[first...index]))
+                    guard let middle = run.coordinateFromStart(distance: length / 2) else { return nil }
+                    return (middle, "+\(minutes) min · Heavy traffic")
+                }
+                start = nil
+            }
+        }
+        return nil
     }
 
     // MARK: Closing in on a turn
@@ -342,7 +445,11 @@ extension NavigationFactory {
         // view: the host switches to the overview when it offers one.
         let overview = _cameraState == "overview"
         let turn = (_doorView == nil && !overview && _fasterTips.isEmpty) ? _turnTag : nil
-        let key = [turn.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? ""]
+        // Traffic is a thing of the road, not of the door; and a faster
+        // route on offer says the same with a way out attached.
+        let traffic = (_doorView == nil && _fasterTips.isEmpty) ? _trafficTag : nil
+        let key = [turn.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? "",
+                   traffic.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? ""]
             + _fasterTips.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" }
         let joined = key.joined(separator: ";") + (_nightMode ? "n" : "d")
         guard joined != _shownTags else { return }
@@ -356,6 +463,12 @@ extension NavigationFactory {
             tag.image = .init(image: Self.tagImage(turn.1, fill: HostMapColor.tip, pointer: true), name: "host-turn-\(turn.1)")
             tag.iconAnchor = .bottom
             tag.iconOffset = [0, -8]
+            tags.append(tag)
+        }
+        if let traffic = traffic {
+            var tag = PointAnnotation(coordinate: traffic.0)
+            tag.image = .init(image: Self.tagImage(traffic.1, fill: HostMapColor.trafficHeavy, pointer: false),
+                              name: "host-traffic-\(traffic.1)")
             tags.append(tag)
         }
         for (at, text) in _fasterTips {

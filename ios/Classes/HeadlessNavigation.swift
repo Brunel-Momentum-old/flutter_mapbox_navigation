@@ -247,6 +247,8 @@ extension NavigationFactory {
         tagNextTurn(progress)
         markDestination(progress)
         closeInOnTurn(progress)
+        tagTraffic(progress)
+        drawTrafficLights()
         guard let data = try? JSONSerialization.data(withJSONObject: navState(for: progress), options: []),
               let json = String(data: data, encoding: .utf8) else { return }
         sendEvent(eventType: MapBoxEventType.nav_state, data: json)
