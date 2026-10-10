@@ -8,6 +8,7 @@ import android.os.Build
 import com.eopeter.fluttermapboxnavigation.FlutterMapboxNavigationPlugin
 import com.eopeter.fluttermapboxnavigation.models.MapBoxEvents
 import com.eopeter.fluttermapboxnavigation.models.MapBoxRouteProgressEvent
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -34,16 +35,34 @@ class PluginUtilities {
             return context.getString(stringRes)
         }
 
+        // Two kinds of listener, and an event belongs to one of them only.
+        // The full-screen activity's go to whoever listens on the
+        // plugin's own channel: the two functions without a sink. An
+        // embedded view's go to the listener on that view's channel,
+        // which the view passes in. They used to share one slot, filled
+        // by whichever listened last and emptied by whichever cancelled
+        // last, so closing one screen could silence the next.
+
         fun sendEvent(event: MapBoxRouteProgressEvent) {
+            sendEvent(FlutterMapboxNavigationPlugin.eventSink, event)
+        }
+
+        fun sendEvent(sink: EventChannel.EventSink?, event: MapBoxRouteProgressEvent) {
+            if (sink == null) return
             val dataString = event.toJson()
             val jsonString = "{" +
                     "  \"eventType\": \"${MapBoxEvents.PROGRESS_CHANGE.value}\"," +
                     "  \"data\": $dataString" +
                     "}"
-            FlutterMapboxNavigationPlugin.eventSink?.success(jsonString)
+            sink.success(jsonString)
         }
 
         fun sendEvent(event: MapBoxEvents, data: String = "") {
+            sendEvent(FlutterMapboxNavigationPlugin.eventSink, event, data)
+        }
+
+        fun sendEvent(sink: EventChannel.EventSink?, event: MapBoxEvents, data: String = "") {
+            if (sink == null) return
             // Always emit valid JSON: raw-JSON events with no payload used to
             // produce `"data": }` (USER_OFF_ROUTE sends none), and string
             // payloads were not escaped (a quote in an instruction broke it).
@@ -53,7 +72,7 @@ class PluginUtilities {
                     "  \"eventType\": \"${event.value}\"," +
                     "  \"data\": $dataJson" +
                     "}"
-            FlutterMapboxNavigationPlugin.eventSink?.success(jsonString)
+            sink.success(jsonString)
         }
 
         fun getListOfStringById(key: String, call: MethodCall): ArrayList<String> {

@@ -10,8 +10,13 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.location.Location
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import com.mapbox.android.gestures.MoveGestureDetector
+import com.mapbox.android.gestures.RotateGestureDetector
+import com.mapbox.android.gestures.ShoveGestureDetector
+import com.mapbox.android.gestures.StandardScaleGestureDetector
 import com.mapbox.geojson.Feature
 import com.mapbox.geojson.FeatureCollection
 import com.mapbox.geojson.LineString
@@ -35,8 +40,15 @@ import com.mapbox.maps.extension.style.layers.generated.symbolLayer
 import com.mapbox.maps.plugin.LocationPuck2D
 import com.mapbox.maps.plugin.animation.MapAnimationOptions
 import com.mapbox.maps.plugin.animation.camera
+import com.mapbox.maps.plugin.annotation.AnnotationConfig
 import com.mapbox.maps.plugin.annotation.annotations
 import com.mapbox.maps.plugin.attribution.attribution
+import com.mapbox.maps.plugin.gestures.OnFlingListener
+import com.mapbox.maps.plugin.gestures.OnMoveListener
+import com.mapbox.maps.plugin.gestures.OnRotateListener
+import com.mapbox.maps.plugin.gestures.OnScaleListener
+import com.mapbox.maps.plugin.gestures.OnShoveListener
+import com.mapbox.maps.plugin.gestures.gestures
 import com.mapbox.maps.plugin.logo.logo
 import com.mapbox.maps.plugin.annotation.generated.PointAnnotationManager
 import com.mapbox.maps.plugin.annotation.generated.PointAnnotationOptions
@@ -50,6 +62,7 @@ import com.mapbox.navigation.dropin.NavigationView
 import com.mapbox.navigation.ui.maps.camera.NavigationCamera
 import com.mapbox.navigation.ui.maps.camera.data.MapboxNavigationViewportDataSource
 import com.mapbox.navigation.ui.maps.camera.lifecycle.NavigationBasicGesturesHandler
+import com.mapbox.navigation.ui.maps.camera.state.NavigationCameraState
 import com.mapbox.navigation.ui.maps.building.api.MapboxBuildingsApi
 import com.mapbox.navigation.ui.maps.building.model.MapboxBuildingHighlightOptions
 import com.mapbox.navigation.ui.maps.building.view.MapboxBuildingView
@@ -60,6 +73,7 @@ import com.mapbox.navigation.ui.maps.route.line.model.RouteLineResources
 import com.mapbox.turf.TurfConstants
 import com.mapbox.turf.TurfMeasurement
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.max
@@ -85,6 +99,61 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val LEFT_ROUTE = Color.parseColor("#8E8B83")
         /** As close as the following camera comes at a turn; iOS uses the same. */
         private const val CLOSEST_FOLLOWING_ZOOM = 18.75
+
+        // What the SDK ships its following camera with (the defaults of
+        // `FollowingFrameOptions`, the same on iOS): the least zoom it
+        // may use, and the closest it comes when left alone.
+        private const val SDK_LEAST_FOLLOWING_ZOOM = 10.5
+        private const val SDK_CLOSEST_FOLLOWING_ZOOM = 16.35
+
+        // The camera starts to close in on a turn this far out, and is
+        // fully in by the second distance. On a fast road the turn
+        // arrives sooner, so each is at least that many seconds of
+        // driving.
+        private const val CLOSE_IN_FROM_M = 200.0
+        private const val CLOSE_IN_FROM_S = 12.0
+        private const val CLOSE_IN_BY_M = 60.0
+        private const val CLOSE_IN_BY_S = 4.0
+
+        /**
+         * Frames a second while the driver is moving, or something on
+         * the map is changing. Left alone the map draws at the display's
+         * rate, 90 or 120 a second on most phones, for the whole trip.
+         * Guidance does not need it and the battery pays for it. This is
+         * what Mapbox's own navigation on iOS draws at on battery.
+         */
+        const val MOVING_FPS = 30
+
+        /**
+         * Stopped, with nothing on the map changing. The picture is the
+         * same at any rate, so this only sets how soon a change shows.
+         */
+        private const val RESTING_FPS = 10
+
+        /**
+         * Fixes without movement before the map rests. A van at a stop
+         * sign is moving again before this.
+         */
+        private const val STILL_FIXES_BEFORE_REST = 3
+
+        /** Less than this many metres between two fixes is not movement. */
+        private const val STILL_M = 0.5f
+
+        /**
+         * How long the map keeps the moving rate after something changed
+         * on it with the driver stopped: the sheet moved, the door view
+         * came up, the driver touched it.
+         */
+        private const val AWAKE_FOR_MS = 3000L
+
+        /**
+         * The least time between two updates of where the route line
+         * turns from travelled to still ahead, in nanoseconds: four a
+         * second. The SDK's own is sixteen a second (62.5 ms), and each
+         * one is a change to the line's layers that the map then has to
+         * draw.
+         */
+        private const val TRAVELLED_LINE_UPDATE_NS = 250_000_000L
         private const val LEFT_ROUTE_ID = "host-left-route"
         private const val TRAFFIC_LIGHT_ID = "host-traffic-lights"
         private const val FASTER_ROUTE_ID = "host-faster-route"
@@ -138,12 +207,19 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     /** Padding the host UI covers, in pixels. */
     var hostPadding: EdgeInsets? = null
         set(value) {
+            // The camera moves to suit: the host's sheet going up or
+            // down, as often as not with the driver stopped.
+            if (value != field) wakeMap()
             field = value
             placeOrnaments()
         }
 
     /** Dark map in use: labels this class adds switch to light on dark. */
     var night = false
+        set(value) {
+            if (value != field) wakeMap()
+            field = value
+        }
 
     private var routeLineAnchor = "road-label-simple"
     private val styleLoaded = OnStyleLoadedListener {
@@ -199,11 +275,15 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         return builder
             .withRouteLineBelowLayerId(routeLineAnchor)
             .withVanishingRouteLineEnabled(true)
+            .vanishingRouteLineUpdateInterval(TRAVELLED_LINE_UPDATE_NS)
             .build()
     }
 
     /** Runs for the style in place and for every style loaded after it. */
     private fun onStyle(style: Style) {
+        // Day to night or back. The new style can arrive well after it
+        // was asked for, so it is this that wakes the map for it.
+        wakeMap()
         val anchor = ROUTE_LINE_ANCHORS.firstOrNull { style.styleLayerExists(it) }
         if (anchor != null && anchor != routeLineAnchor) {
             routeLineAnchor = anchor
@@ -224,10 +304,19 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         doorPolygonManager = null
         tagManager = null
         shownTurnTag = ""
+        shownTrafficTag = ""
         shownFasterTips = ""
         destinationPinManager = null
         shownDestinationPin = ""
+        // A new map has a camera of its own, to be found and tuned again.
         followCameraTuned = false
+        followViewport = null
+        followCamera = null
+        watchTouches(view)
+        // Whatever rate this map was made with, it starts at the moving
+        // one, and what the last map was set to says nothing about it.
+        mapFps = 0
+        resetPace()
         placeOrnaments()
         view.getMapboxMap().addOnStyleLoadedListener(styleLoaded)
         view.getMapboxMap().getStyle { onStyle(it) }
@@ -256,12 +345,17 @@ class MapLook(private val context: Context, private val navigationView: Navigati
 
     fun onMapDetached() {
         mapView?.getMapboxMap()?.removeOnStyleLoadedListener(styleLoaded)
+        // A map let go of while resting is not left at the resting rate.
+        resetPace()
+        mapView?.let { stopWatchingTouches(it) }
         buildingsApi?.cancel()
         buildingsApi = null
         mapView = null
         pinManager = null
         doorPointManager = null
         doorPolygonManager = null
+        followViewport = null
+        followCamera = null
     }
 
     // ---- route look ---------------------------------------------------
@@ -370,6 +464,18 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         refreshTags()
     }
 
+    private var trafficTag: Pair<Point, String>? = null
+    private var shownTrafficTag = ""
+
+    /**
+     * Heavy traffic ahead on the route, tagged in the middle of it with
+     * what it costs ("+3 min · Heavy traffic"). Null for none.
+     */
+    fun setTrafficTag(point: Point?, text: String?) {
+        trafficTag = if (point == null || text.isNullOrBlank()) null else point to text
+        refreshTags()
+    }
+
     private var destinationPinManager: PointAnnotationManager? = null
     private var destinationPin: Pair<Point, Double?>? = null
     private var shownDestinationPin = ""
@@ -396,13 +502,21 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }.orEmpty()
         if (key == shownDestinationPin) return
         shownDestinationPin = key
-        val manager = destinationPinManager ?: view.annotations.createPointAnnotationManager().also {
-            // The arrow is a direction on the ground: it turns with the
-            // map, and nothing may hide it.
-            it.iconRotationAlignment = IconRotationAlignment.MAP
-            it.iconAllowOverlap = true
-            it.iconIgnorePlacement = true
-            destinationPinManager = it
+        val manager = destinationPinManager ?: run {
+            // Under the driver's own marker: stopped at the end of the
+            // route the two are in the same place, and the marker is the
+            // one that has to show. On top, the pin hid it.
+            val underMarker = view.getMapboxMap().getStyle()
+                ?.takeIf { it.styleLayerExists(PUCK_LAYER) }
+                ?.let { AnnotationConfig(belowLayerId = PUCK_LAYER) }
+            view.annotations.createPointAnnotationManager(underMarker).also {
+                // The arrow is a direction on the ground: it turns with
+                // the map, and no label may hide it.
+                it.iconRotationAlignment = IconRotationAlignment.MAP
+                it.iconAllowOverlap = true
+                it.iconIgnorePlacement = true
+                destinationPinManager = it
+            }
         }
         manager.deleteAll()
         if (pin == null) return
@@ -500,9 +614,14 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         // the host switches to when it offers one, and stay in any view.
         val turn = turnTag?.takeIf { !doorEnabled && !overview && fasterRoute == null }
         val turnKey = turn?.let { "${it.first.latitude()},${it.first.longitude()},${it.second}" }.orEmpty()
+        // Traffic is a thing of the road, not of the door; and a faster
+        // route on offer says the same with a way out attached.
+        val traffic = trafficTag?.takeIf { !doorEnabled && fasterRoute == null }
+        val trafficKey = traffic?.let { "${it.first.latitude()},${it.first.longitude()},${it.second}" }.orEmpty()
         val tipsKey = fasterTips.joinToString(";") { "${it.first.latitude()},${it.first.longitude()},${it.second}" }
-        if (turnKey == shownTurnTag && tipsKey == shownFasterTips) return
+        if (turnKey == shownTurnTag && trafficKey == shownTrafficTag && tipsKey == shownFasterTips) return
         shownTurnTag = turnKey
+        shownTrafficTag = trafficKey
         shownFasterTips = tipsKey
         val manager = tagManager ?: view.annotations.createPointAnnotationManager().also { tagManager = it }
         manager.deleteAll()
@@ -512,6 +631,14 @@ class MapLook(private val context: Context, private val navigationView: Navigati
                     .withIconImage(tagBitmap(turn.second, TIP, pointer = true))
                     .withIconAnchor(IconAnchor.BOTTOM)
                     .withIconOffset(listOf(0.0, -8.0))
+            )
+        }
+        if (traffic != null) {
+            // In the red the route line has for heavy traffic, and sat
+            // on the line: it marks a stretch, not a point.
+            manager.create(
+                PointAnnotationOptions().withPoint(traffic.first)
+                    .withIconImage(tagBitmap(traffic.second, TRAFFIC_HEAVY, pointer = false))
             )
         }
         for ((point, text) in fasterTips) {
@@ -566,6 +693,9 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     // ---- door view ----------------------------------------------------
 
     fun setDoorView(enabled: Boolean, side: String?, latitude: Double?, longitude: Double?, label: String?) {
+        // Coming up, changing or going away, the camera moves for it,
+        // and the driver has usually just stopped.
+        wakeMap()
         if (!enabled) {
             leaveDoorView()
             return
@@ -590,6 +720,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     fun leaveDoorView() {
         if (!doorEnabled) return
         doorEnabled = false
+        wakeMap()
         // The building's marking goes with the view. Coming back for the
         // same stop has to look for the building again, or it marks
         // nothing.
@@ -637,9 +768,234 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             viewport.options.followingFrameOptions.maxZoom = CLOSEST_FOLLOWING_ZOOM
             viewport.evaluate()
             followCameraTuned = true
+            // Kept, so that closing in on a turn and pacing the map do
+            // not have to go looking for them again on every tick.
+            followViewport = viewport
+            followCamera = camera as? NavigationCamera
         } catch (e: Exception) {
             followCameraTuned = true
             Log.w("MapLook", "follow camera left as the SDK ships it: $e")
+        }
+    }
+
+    // ---- closing in on a turn -----------------------------------------
+
+    // Where the following camera takes its zoom limits from: found once
+    // by [tuneFollowCamera], for the map now attached.
+    private var followViewport: MapboxNavigationViewportDataSource? = null
+    private var closeInFailed = false
+
+    /**
+     * Holds the following camera close as a turn comes up. Runs on every
+     * progress tick. [distanceToTurn] is in metres, and null when what
+     * comes next is not a turn: arriving is not one, the door view frames
+     * that. [speed] is the driver's, in metres a second.
+     *
+     * The SDK works the zoom out from how much road is left before the
+     * turn, and it does come in, but not reliably: a short street, or a
+     * run of junctions, and it was still showing several blocks with the
+     * turn 30 m away. So the least zoom it may use is raised as the turn
+     * nears, from the SDK's own closest at 200 m to nearly the closest
+     * allowed ([CLOSEST_FOLLOWING_ZOOM]) inside 60 m. On a fast road the
+     * turn arrives sooner, so both distances are at least a few seconds
+     * of driving: at 100 km/h it starts 330 m out and is fully in by
+     * 110 m. With no turn near it goes back to what the SDK ships.
+     */
+    fun closeInOnTurn(distanceToTurn: Double?, speed: Double) {
+        val viewport = followViewport ?: return
+        if (closeInFailed) return
+        try {
+            val near = CLOSEST_FOLLOWING_ZOOM - 0.25
+            var least = SDK_LEAST_FOLLOWING_ZOOM
+            if (distanceToTurn != null && distanceToTurn.isFinite()) {
+                val pace = if (speed.isFinite()) max(0.0, speed) else 0.0
+                val from = max(CLOSE_IN_FROM_M, pace * CLOSE_IN_FROM_S)
+                val by = max(CLOSE_IN_BY_M, pace * CLOSE_IN_BY_S)
+                if (distanceToTurn <= by) {
+                    least = near
+                } else if (distanceToTurn <= from) {
+                    least = SDK_CLOSEST_FOLLOWING_ZOOM +
+                        (from - distanceToTurn) / (from - by) * (near - SDK_CLOSEST_FOLLOWING_ZOOM)
+                }
+            }
+            val options = viewport.options.followingFrameOptions
+            // Only a change worth seeing is written: every write has the
+            // camera work its frame out again.
+            if (abs(options.minZoom - least) <= 0.05 && options.maxZoom == CLOSEST_FOLLOWING_ZOOM) return
+            options.minZoom = least
+            options.maxZoom = CLOSEST_FOLLOWING_ZOOM
+            // The SDK reads the limits when it works the frame out, not
+            // when they are set, so it is asked to do that now and not
+            // at its next fix.
+            viewport.evaluate()
+        } catch (e: Exception) {
+            closeInFailed = true
+            Log.w("MapLook", "camera not held close at turns: $e")
+        }
+    }
+
+    // ---- how often the map draws --------------------------------------
+
+    // The SDK's camera, kept from the same search as [followViewport]:
+    // it knows when it is part-way between following and overview.
+    private var followCamera: NavigationCamera? = null
+    private var stillFixes = 0
+    private var lastPacedFix: Location? = null
+    private var awakeUntilMs = 0L
+
+    // The rate the map was last set to. 0 for a map not set yet.
+    private var mapFps = 0
+    private var pacingFailed = false
+
+    /**
+     * Sets how often the map draws, for the fix just handled: the moving
+     * rate while the van moves, the resting rate once it has stood still
+     * for a few fixes. A van waiting at a stop or at a light shows the
+     * same picture from one fix to the next, and the battery pays for
+     * every frame of it. The first fix that moves brings the moving rate
+     * straight back.
+     *
+     * [location] is where the navigator has the driver. [phoneSpeed] is
+     * the phone's own reading, in metres a second: the navigator can
+     * take a fix or two to move off after the phone has.
+     */
+    fun paceMap(location: Location, phoneSpeed: Float) {
+        try {
+            val last = lastPacedFix
+            val moved = last == null || location.distanceTo(last) > STILL_M
+            val speed = max(if (location.hasSpeed()) location.speed else 0f, phoneSpeed)
+            lastPacedFix = location
+            stillFixes = if (moved || speed >= LocationSteadier.MOVING_SPEED) 0 else stillFixes + 1
+            val resting = stillFixes >= STILL_FIXES_BEFORE_REST &&
+                !cameraBetweenModes() &&
+                SystemClock.elapsedRealtime() >= awakeUntilMs
+            setMapFps(if (resting) RESTING_FPS else MOVING_FPS)
+        } catch (e: Exception) {
+            stopPacing("map not paced to the driver", e)
+        }
+    }
+
+    /**
+     * Something is about to change on the map, perhaps with the driver
+     * stopped: the moving rate from now until it has had time to finish.
+     */
+    fun wakeMap() {
+        awakeUntilMs = SystemClock.elapsedRealtime() + AWAKE_FOR_MS
+        setMapFps(MOVING_FPS)
+    }
+
+    /**
+     * Back to the moving rate with nothing remembered of the fixes
+     * before. For a trip starting, and for a map coming or going.
+     */
+    fun resetPace() {
+        stillFixes = 0
+        lastPacedFix = null
+        awakeUntilMs = 0L
+        setMapFps(MOVING_FPS)
+    }
+
+    /**
+     * Part-way between following and overview the camera is moving,
+     * whatever the driver is doing.
+     */
+    private fun cameraBetweenModes(): Boolean {
+        val state = followCamera?.state
+        return state == NavigationCameraState.TRANSITION_TO_FOLLOWING ||
+            state == NavigationCameraState.TRANSITION_TO_OVERVIEW
+    }
+
+    private fun setMapFps(fps: Int) {
+        if (fps == mapFps || pacingFailed) return
+        val view = mapView ?: return
+        try {
+            view.setMaximumFps(fps)
+            mapFps = fps
+        } catch (e: Exception) {
+            stopPacing("map frame rate not set", e)
+        }
+    }
+
+    /**
+     * Pacing that has failed once is not tried again. The map is put back
+     * to the moving rate, if it will go, and stays there: a map that
+     * draws more than it needs is better than one stuck at the resting
+     * rate under a moving van.
+     */
+    private fun stopPacing(what: String, e: Exception) {
+        if (pacingFailed) return
+        pacingFailed = true
+        Log.w("MapLook", "$what, the map keeps its moving rate: $e")
+        try {
+            mapView?.setMaximumFps(MOVING_FPS)
+        } catch (_: Exception) {
+            // It keeps whatever rate it has.
+        }
+    }
+
+    // A touch on the map changes the picture with the driver stopped.
+    // Each of these wakes the map through to the end of the gesture, and
+    // the awake time after it covers the glide that follows.
+    private val moveListener = object : OnMoveListener {
+        override fun onMoveBegin(detector: MoveGestureDetector) = wakeMap()
+
+        override fun onMove(detector: MoveGestureDetector): Boolean {
+            wakeMap()
+            // Not handled here: the map still has to move.
+            return false
+        }
+
+        override fun onMoveEnd(detector: MoveGestureDetector) = wakeMap()
+    }
+
+    private val scaleListener = object : OnScaleListener {
+        override fun onScaleBegin(detector: StandardScaleGestureDetector) = wakeMap()
+        override fun onScale(detector: StandardScaleGestureDetector) = wakeMap()
+        override fun onScaleEnd(detector: StandardScaleGestureDetector) = wakeMap()
+    }
+
+    private val rotateListener = object : OnRotateListener {
+        override fun onRotateBegin(detector: RotateGestureDetector) = wakeMap()
+        override fun onRotate(detector: RotateGestureDetector) = wakeMap()
+        override fun onRotateEnd(detector: RotateGestureDetector) = wakeMap()
+    }
+
+    // Two fingers dragged up or down, which tilts the map.
+    private val shoveListener = object : OnShoveListener {
+        override fun onShoveBegin(detector: ShoveGestureDetector) = wakeMap()
+        override fun onShove(detector: ShoveGestureDetector) = wakeMap()
+        override fun onShoveEnd(detector: ShoveGestureDetector) = wakeMap()
+    }
+
+    private val flingListener = object : OnFlingListener {
+        override fun onFling() = wakeMap()
+    }
+
+    private fun watchTouches(view: MapView) {
+        try {
+            val gestures = view.gestures
+            gestures.addOnMoveListener(moveListener)
+            gestures.addOnScaleListener(scaleListener)
+            gestures.addOnRotateListener(rotateListener)
+            gestures.addOnShoveListener(shoveListener)
+            gestures.addOnFlingListener(flingListener)
+        } catch (e: Exception) {
+            // Unwatched, a touch would find the map at the resting rate
+            // and drag it about in jerks. So it does not rest at all.
+            stopPacing("touches on the map not watched", e)
+        }
+    }
+
+    private fun stopWatchingTouches(view: MapView) {
+        try {
+            val gestures = view.gestures
+            gestures.removeOnMoveListener(moveListener)
+            gestures.removeOnScaleListener(scaleListener)
+            gestures.removeOnRotateListener(rotateListener)
+            gestures.removeOnShoveListener(shoveListener)
+            gestures.removeOnFlingListener(flingListener)
+        } catch (_: Exception) {
+            // The map is on its way out with its listeners.
         }
     }
 
@@ -881,7 +1237,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         return bitmap
     }
 
-    /** A dark or green rounded tag with white text; [pointer] adds a tail pointing down. */
+    /** A rounded tag in [fill] with white text; [pointer] adds a tail pointing down. */
     private fun tagBitmap(text: String, fill: Int, pointer: Boolean): Bitmap {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.typeface = Typeface.DEFAULT_BOLD

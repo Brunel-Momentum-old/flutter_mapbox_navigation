@@ -30,6 +30,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.mapbox.maps.Style
 import com.mapbox.api.directions.v5.DirectionsCriteria
+import com.mapbox.api.directions.v5.models.RouteLeg
 import com.mapbox.api.directions.v5.models.RouteOptions
 import com.mapbox.geojson.LineString
 import com.mapbox.geojson.Point
@@ -43,7 +44,9 @@ import com.mapbox.navigation.base.route.RouterOrigin
 import com.mapbox.navigation.base.trip.model.RouteLegProgress
 import com.mapbox.navigation.base.trip.model.RouteProgress
 import com.mapbox.navigation.core.arrival.ArrivalObserver
+import com.mapbox.navigation.core.directions.session.RoutesExtra
 import com.mapbox.navigation.core.directions.session.RoutesObserver
+import com.mapbox.navigation.core.directions.session.RoutesUpdatedResult
 import com.mapbox.navigation.core.lifecycle.MapboxNavigationApp
 import com.mapbox.navigation.core.trip.session.*
 import io.flutter.plugin.common.EventChannel
@@ -67,6 +70,23 @@ private const val CAMERA_TOP_MARGIN_DP = 64f
 /** Keeps the route and its pins off the screen edges in the overview. */
 private const val CAMERA_SIDE_MARGIN_DP = 32f
 
+/** A stretch of heavy traffic shorter than this, in metres, gets no tag. */
+private const val TRAFFIC_TAG_MIN_RUN_M = 100.0
+
+/** Nor does a delay of fewer minutes than this: not worth a driver's glance. */
+private const val TRAFFIC_TAG_MIN_MINUTES = 2
+
+/** How long before the traffic ahead is looked at again on the same route. */
+private const val TRAFFIC_RECHECK_MS = 30_000L
+
+/**
+ * Where heavy traffic starts when the directions give congestion as a
+ * number from 0 to 100, which is how the navigation SDK asks for it. This
+ * is the SDK's own line between moderate and heavy, so the tag and the
+ * red on the route line agree.
+ */
+private const val HEAVY_CONGESTION_FROM = 60
+
 open class TurnByTurn(
     ctx: Context,
     act: Activity,
@@ -78,7 +98,63 @@ open class TurnByTurn(
 
     open fun initFlutterChannelHandlers() {
         this.methodChannel?.setMethodCallHandler(this)
-        this.eventChannel?.setStreamHandler(this)
+        val channel = this.eventChannel ?: return
+        val relay = EventRelay(this, channel)
+        this.eventRelay = relay
+        channel.setStreamHandler(relay)
+    }
+
+    /**
+     * Lets the engine's hold on this view through its event channel go.
+     * For when the view is disposed: nothing is sent after this.
+     */
+    protected fun releaseEventChannel() {
+        this.eventSink = null
+        this.eventRelay?.release()
+        this.eventRelay = null
+    }
+
+    /**
+     * What the engine holds as the handler of a view's event channel, in
+     * place of the view.
+     *
+     * The engine keeps a handler for as long as it is set, and with it
+     * everything the handler can reach. When that was the view, a closed
+     * navigation screen stayed within reach for as long as the app ran.
+     * Taking the handler off as the view is disposed is not the answer
+     * either: the Dart side cancels its stream a moment after the view
+     * has gone, and a cancel that finds no handler comes back to it as an
+     * error. So this lets go of the view at once, stays to answer that
+     * cancel, and takes itself off when it comes.
+     */
+    private class EventRelay(
+        private var view: TurnByTurn?,
+        private val channel: EventChannel,
+    ) : EventChannel.StreamHandler {
+        private var listening = false
+
+        override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+            this.listening = true
+            this.view?.onListen(arguments, events)
+        }
+
+        override fun onCancel(arguments: Any?) {
+            this.listening = false
+            val view = this.view
+            if (view != null) {
+                view.onCancel(arguments)
+            } else {
+                // The cancel that was being waited for.
+                this.channel.setStreamHandler(null)
+            }
+        }
+
+        /** The view has been disposed. */
+        fun release() {
+            this.view = null
+            // Nobody listening: no cancel is on its way to wait for.
+            if (!this.listening) this.channel.setStreamHandler(null)
+        }
     }
 
     open fun initNavigation() {
@@ -137,6 +213,7 @@ open class TurnByTurn(
                 result.success(true)
             }
             "showOverview" -> {
+                this.mapLook.wakeMap()
                 SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Overview))
                 // Said here and now, not when Drop-In gets round to
                 // reporting it: the door view moves the camera on the
@@ -146,6 +223,7 @@ open class TurnByTurn(
                 result.success(true)
             }
             "recenter", "reCenter" -> {
+                this.mapLook.wakeMap()
                 if (this.mapLook.isDoorView) {
                     SharedApp.store.dispatch(CameraAction.SetCameraMode(TargetCameraMode.Idle))
                     this.sendCameraState("following")
@@ -243,7 +321,7 @@ open class TurnByTurn(
         if (points == null || MapboxNavigationApp.current() == null) {
             // Not ready (Drop-In not initialised yet) or no waypoints: reply
             // false instead of crashing on a null navigation instance.
-            PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
+            this.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
             result.success(false)
             return
         }
@@ -261,7 +339,7 @@ open class TurnByTurn(
     private fun getRoute(context: Context) {
         val navigation = MapboxNavigationApp.current()
         if (navigation == null) {
-            PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
+            this.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
             return
         }
         navigation.requestRoutes(
@@ -286,7 +364,8 @@ open class TurnByTurn(
                     routerOrigin: RouterOrigin
                 ) {
                     this@TurnByTurn.currentRoutes = routes
-                    PluginUtilities.sendEvent(
+                    this@TurnByTurn.ownRouteIds.addAll(routes.map { it.id })
+                    this@TurnByTurn.sendEvent(
                         MapBoxEvents.ROUTE_BUILT,
                         Gson().toJson(routes.map { it.directionsRoute.toJson() })
                     )
@@ -296,7 +375,7 @@ open class TurnByTurn(
                     this@TurnByTurn.binding.navigationView.api.startRoutePreview(routes)
                     this@TurnByTurn.binding.navigationView.customizeViewBinders {
                         this.infoPanelEndNavigationButtonBinder =
-                            CustomInfoPanelEndNavButtonBinder(activity)
+                            CustomInfoPanelEndNavButtonBinder(activity) { this@TurnByTurn.sendEvent(it) }
                     }
                 }
 
@@ -304,14 +383,14 @@ open class TurnByTurn(
                     reasons: List<RouterFailure>,
                     routeOptions: RouteOptions
                 ) {
-                    PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
+                    this@TurnByTurn.sendEvent(MapBoxEvents.ROUTE_BUILD_FAILED)
                 }
 
                 override fun onCanceled(
                     routeOptions: RouteOptions,
                     routerOrigin: RouterOrigin
                 ) {
-                    PluginUtilities.sendEvent(MapBoxEvents.ROUTE_BUILD_CANCELLED)
+                    this@TurnByTurn.sendEvent(MapBoxEvents.ROUTE_BUILD_CANCELLED)
                 }
             }
         )
@@ -321,7 +400,7 @@ open class TurnByTurn(
         this.currentRoutes = null
         val navigation = MapboxNavigationApp.current()
         navigation?.stopTripSession()
-        PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+        this.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
         result.success(true)
     }
 
@@ -357,7 +436,7 @@ open class TurnByTurn(
     @SuppressLint("MissingPermission")
     private fun startNavigation() {
         if (this.currentRoutes == null) {
-            PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+            this.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
             return
         }
         // Whatever route the shared navigation object still holds from a
@@ -372,8 +451,14 @@ open class TurnByTurn(
         this.mapLook.setRouteLook("normal", null)
         // And the last trip's stop is not this one's.
         this.mapLook.setDestinationPin(null, null)
+        // Nor its traffic.
+        this.clearTrafficTag()
+        // Nor is how long the driver stood before it, or the turn the
+        // camera was last holding close.
+        this.mapLook.resetPace()
+        this.mapLook.closeInOnTurn(null, 0.0)
         this.binding.navigationView.api.startActiveGuidance(this.currentRoutes!!)
-        PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_RUNNING)
+        this.sendEvent(MapBoxEvents.NAVIGATION_RUNNING)
     }
 
     private fun finishNavigation(isOffRouted: Boolean = false) {
@@ -385,9 +470,59 @@ open class TurnByTurn(
         MapboxNavigationApp.current()?.setNavigationRoutes(emptyList())
         // No route, no progress to say the tunnel has ended.
         this.locationEngine?.inTunnel = false
+        // Nor any to say the turn the camera was holding close is past,
+        // or to take the traffic tag off a route that is no longer there.
+        this.mapLook.closeInOnTurn(null, 0.0)
+        this.clearTrafficTag()
         this.guidanceStarted = false
         this.isNavigationCanceled = true
-        PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+        this.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+    }
+
+    /**
+     * Keeps [ownRouteIds] up with the trip. A re-route or a new
+     * alternative gives the trip routes with ids of their own, and they
+     * are this view's as much as the ones it asked for. They are taken
+     * as such when the route they replace was this view's, or the first
+     * of them already is (this view starting its trip, or switching to
+     * an alternative it was offered). Routes that somebody else has set
+     * on the navigator are neither.
+     */
+    private fun adoptRoutes(update: RoutesUpdatedResult) {
+        val routes = update.navigationRoutes
+        val first = routes.firstOrNull() ?: return
+        val replacesOwn = update.reason != RoutesExtra.ROUTES_UPDATE_REASON_NEW &&
+            this.activeRoutes.firstOrNull()?.id in this.ownRouteIds
+        if (replacesOwn || first.id in this.ownRouteIds) {
+            routes.forEach { this.ownRouteIds.add(it.id) }
+        }
+    }
+
+    /**
+     * The safety net for a view taken down with its trip still running.
+     * Nothing else ends a trip but the host asking for it, so a screen
+     * that went without asking would leave the navigator guiding along
+     * its route with no screen to show it.
+     *
+     * Only when the route the navigator is on is still one of this
+     * view's. The navigator outlives the view, and by the time an old
+     * view is disposed a newer one may have a trip of its own on it.
+     * That one is not this view's to stop.
+     */
+    protected fun finishTripLeftRunning() {
+        if (!this.guidanceStarted) return
+        this.guidanceStarted = false
+        this.isNavigationCanceled = true
+        try {
+            val navigation = MapboxNavigationApp.current() ?: return
+            val running = navigation.getNavigationRoutes().firstOrNull()?.id ?: return
+            if (running !in this.ownRouteIds) return
+            navigation.stopTripSession()
+            navigation.setNavigationRoutes(emptyList())
+            this.locationEngine?.inTunnel = false
+        } catch (e: java.lang.Exception) {
+            Log.w("TurnByTurn", "trip of a disposed view not ended: $e")
+        }
     }
 
     private fun setOptions(arguments: Map<*, *>) {
@@ -477,6 +612,11 @@ open class TurnByTurn(
             this.longPressDestinationEnabled = longPress
         }
 
+        val progress = arguments["progressEvents"] as? Boolean
+        if (progress != null) {
+            this.progressEvents = progress
+        }
+
         val onMapTap = arguments["enableOnMapTapCallback"] as? Boolean
         if (onMapTap != null) {
             this.enableOnMapTapCallback = onMapTap
@@ -513,11 +653,28 @@ open class TurnByTurn(
 
     // Flutter stream listener delegate methods
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-        FlutterMapboxNavigationPlugin.eventSink = events
+        this.eventSink = events
     }
 
     override fun onCancel(arguments: Any?) {
-        FlutterMapboxNavigationPlugin.eventSink = null
+        this.eventSink = null
+    }
+
+    /**
+     * Sends an event to whoever listens on this view's own channel.
+     *
+     * Every view used to send through one slot shared by the whole
+     * plugin, filled by whichever view was listened to last and emptied
+     * by whichever was cancelled last. Closing one navigation screen and
+     * opening another, the old view's cancel could land after the new
+     * view's listen and leave the new screen with no events at all.
+     */
+    protected fun sendEvent(event: MapBoxEvents, data: String = "") {
+        PluginUtilities.sendEvent(this.eventSink, event, data)
+    }
+
+    private fun sendEvent(event: MapBoxRouteProgressEvent) {
+        PluginUtilities.sendEvent(this.eventSink, event)
     }
 
     private val context: Context = ctx
@@ -525,6 +682,10 @@ open class TurnByTurn(
     private val token: String = accessToken
     open var methodChannel: MethodChannel? = null
     open var eventChannel: EventChannel? = null
+
+    /// Where this view's events go: the listener on its own channel.
+    private var eventSink: EventChannel.EventSink? = null
+    private var eventRelay: EventRelay? = null
     private var lastLocation: Location? = null
 
     /// The location engine the navigator was set up with, kept so it can
@@ -560,6 +721,11 @@ open class TurnByTurn(
     private var voiceInstructionsEnabled = true
     private var bannerInstructionsEnabled = true
     private var longPressDestinationEnabled = true
+
+    /// Whether `progress_change` goes out on every tick. It carries the
+    /// whole leg, step by step, and is built and encoded afresh each
+    /// second. A host that reads `nav_state` turns it off.
+    protected var progressEvents = true
     private var enableOnMapTapCallback = false
     private var animateBuildRoute = true
     private var isOptimized = false
@@ -571,6 +737,10 @@ open class TurnByTurn(
     private var guidanceStarted = false
     private var leftoverRouteIds: Set<String> = emptySet()
 
+    /// Every route that is this view's: the ones it asked for, and the
+    /// ones re-routing and alternatives have brought into its trip since.
+    private val ownRouteIds = mutableSetOf<String>()
+
     // State behind the nav_state event.
     private var lastProgress: RouteProgress? = null
     private var activeRoutes: List<NavigationRoute> = emptyList()
@@ -578,6 +748,10 @@ open class TurnByTurn(
 
     /// When the phone last reported a position, on the uptime clock.
     private var lastRawFixAtMs: Long? = null
+
+    /// The speed in the last fix handed to the navigator, in metres a
+    /// second. The navigator's own can lag it by a fix or two.
+    private var lastRawSpeed = 0f
     private var rerouting = false
     private var arrived = false
     private var speedLimitKmph: Int? = null
@@ -611,9 +785,18 @@ open class TurnByTurn(
             this@TurnByTurn.lastLocation = locationMatcherResult.enhancedLocation
             this@TurnByTurn.speedLimitKmph = locationMatcherResult.speedLimit?.speedKmph
             this@TurnByTurn.mapLook.onLocation(locationMatcherResult.enhancedLocation)
+            // Last, once everything this fix moves on the map is moving.
+            this@TurnByTurn.mapLook.paceMap(
+                locationMatcherResult.enhancedLocation,
+                this@TurnByTurn.lastRawSpeed,
+            )
         }
 
         override fun onNewRawLocation(rawLocation: Location) {
+            // Made up or not, this is the speed the navigator was given.
+            // A made-up fix says standing still, and that is what lets
+            // the map rest while a lost driver is held in place.
+            this@TurnByTurn.lastRawSpeed = if (rawLocation.hasSpeed()) rawLocation.speed else 0f
             // A fix the location engine made up to hold a lost driver in
             // place is not the phone speaking.
             if (rawLocation.extras?.getBoolean(SteadyLocationEngine.MADE_UP) == true) return
@@ -622,29 +805,30 @@ open class TurnByTurn(
     }
 
     private val bannerInstructionObserver = BannerInstructionsObserver { bannerInstructions ->
-        PluginUtilities.sendEvent(MapBoxEvents.BANNER_INSTRUCTION, bannerInstructions.primary().text())
+        this.sendEvent(MapBoxEvents.BANNER_INSTRUCTION, bannerInstructions.primary().text())
     }
 
     private val voiceInstructionObserver = VoiceInstructionsObserver { voiceInstructions ->
-        PluginUtilities.sendEvent(MapBoxEvents.SPEECH_ANNOUNCEMENT, voiceInstructions.announcement().toString())
+        this.sendEvent(MapBoxEvents.SPEECH_ANNOUNCEMENT, voiceInstructions.announcement().toString())
     }
 
     private val offRouteObserver = OffRouteObserver { offRoute ->
         this.offRoute = offRoute
         if (offRoute) {
-            PluginUtilities.sendEvent(MapBoxEvents.USER_OFF_ROUTE)
+            this.sendEvent(MapBoxEvents.USER_OFF_ROUTE)
         }
         this.emitNavState()
     }
 
     private val routesObserver = RoutesObserver { routeUpdateResult ->
+        this.adoptRoutes(routeUpdateResult)
         this.activeRoutes = routeUpdateResult.navigationRoutes
         this.mapLook.setTrafficLights(this.trafficLightsOn(routeUpdateResult.navigationRoutes.firstOrNull()))
         if (routeUpdateResult.navigationRoutes.isNotEmpty()) {
-            PluginUtilities.sendEvent(MapBoxEvents.REROUTE_ALONG);
+            this.sendEvent(MapBoxEvents.REROUTE_ALONG);
         }
         if (this.fasterAlternative() != null) {
-            PluginUtilities.sendEvent(MapBoxEvents.FASTER_ROUTE_FOUND)
+            this.sendEvent(MapBoxEvents.FASTER_ROUTE_FOUND)
         }
         this.emitNavState()
     }
@@ -652,7 +836,7 @@ open class TurnByTurn(
     private val rerouteStateObserver = RerouteController.RerouteStateObserver { state ->
         this.rerouting = state is RerouteState.FetchingRoute
         if (state is RerouteState.Failed) {
-            PluginUtilities.sendEvent(MapBoxEvents.FAILED_TO_REROUTE, state.message)
+            this.sendEvent(MapBoxEvents.FAILED_TO_REROUTE, state.message)
         }
         this.emitNavState()
     }
@@ -672,12 +856,15 @@ open class TurnByTurn(
     }
 
     private fun sendCameraState(state: String) {
+        // The camera is about to move, whatever the driver is doing, and
+        // a map resting at a stop has to draw it moving.
+        this.mapLook.wakeMap()
         // The door view parks Drop-In's camera on purpose; to the host
         // the map is still following the driver.
         val reported = if (state == "free" && this.mapLook.isDoorView) "following" else state
         if (reported == this.cameraState) return
         this.cameraState = reported
-        PluginUtilities.sendEvent(MapBoxEvents.CAMERA_STATE, reported)
+        this.sendEvent(MapBoxEvents.CAMERA_STATE, reported)
         this.mapLook.onCameraState(reported)
     }
 
@@ -784,6 +971,147 @@ open class TurnByTurn(
         } else {
             this.mapLook.setTurnTag(maneuver.location(), street ?: step.name())
         }
+    }
+
+    /// What the traffic tag was last worked out for, and when.
+    private var trafficCheckedRoute: NavigationRoute? = null
+    private var trafficCheckedLeg = -1
+    private var trafficCheckedAtMs = 0L
+
+    /**
+     * Tags the first stretch of heavy traffic ahead with what it costs:
+     * "+3 min · Heavy traffic". The red on the line says where; this
+     * says how much, which is what makes a driver decide.
+     *
+     * Worked out again when the route or the leg changes (a refresh of
+     * the traffic gives a new route object, so that counts) and every
+     * half minute, not on every tick: the line is walked from the driver
+     * to the stop each time.
+     */
+    private fun tagTraffic(progress: RouteProgress) {
+        val route = progress.navigationRoute
+        val leg = progress.currentLegProgress?.legIndex ?: -1
+        val now = SystemClock.elapsedRealtime()
+        if (route === this.trafficCheckedRoute && leg == this.trafficCheckedLeg &&
+            now - this.trafficCheckedAtMs < TRAFFIC_RECHECK_MS) {
+            return
+        }
+        this.trafficCheckedRoute = route
+        this.trafficCheckedLeg = leg
+        this.trafficCheckedAtMs = now
+        var tag: Pair<Point, String>? = null
+        try {
+            tag = this.heavyTrafficAhead(progress)
+        } finally {
+            // Whatever went wrong, the tag from half a minute ago does
+            // not stay up in its place.
+            this.mapLook.setTrafficTag(tag?.first, tag?.second)
+        }
+    }
+
+    /** Takes the traffic tag off and forgets what it was worked out for. */
+    private fun clearTrafficTag() {
+        this.trafficCheckedRoute = null
+        this.trafficCheckedLeg = -1
+        this.mapLook.setTrafficTag(null, null)
+    }
+
+    /**
+     * Where the tag goes and what it says, or null for no tag.
+     *
+     * The delay is the leg's expected time over its typical time, so
+     * there is a tag only where the directions give both, and only from
+     * two minutes up. The stretch is the first run of heavy or severe
+     * pieces from the driver onward that is at least 100 m long, and the
+     * tag sits at the middle of it.
+     */
+    private fun heavyTrafficAhead(progress: RouteProgress): Pair<Point, String>? {
+        val legProgress = progress.currentLegProgress ?: return null
+        val directions = progress.navigationRoute.directionsRoute
+        val legs = directions.legs() ?: return null
+        val leg = legs.getOrNull(legProgress.legIndex) ?: return null
+        val expected = leg.duration() ?: return null
+        val typical = leg.durationTypical() ?: return null
+        val minutes = ((expected - typical) / 60.0).roundToInt()
+        if (minutes < TRAFFIC_TAG_MIN_MINUTES) return null
+        val heavy = this.heavyPieces(leg) ?: return null
+
+        // The congestion is given leg by leg, one level for each piece
+        // of the leg's line; the line is given once, for the whole
+        // route. So this leg's pieces start after those of the legs
+        // before it, and every piece of every leg has to be accounted
+        // for, or the two cannot be matched up and nothing is said.
+        val geometry = directions.geometry() ?: return null
+        val line = LineString.fromPolyline(geometry, 6).coordinates()
+        var before = 0
+        var pieces = 0
+        for ((index, each) in legs.withIndex()) {
+            val count = if (index == legProgress.legIndex) heavy.size else this.pieceCount(each) ?: return null
+            if (index < legProgress.legIndex) before += count
+            pieces += count
+        }
+        if (line.size != pieces + 1) return null
+
+        val from = legProgress.geometryIndex.coerceIn(0, heavy.size)
+        var start = -1
+        var length = 0.0
+        // One past the end, so a run that reaches the stop is closed too.
+        for (index in from..heavy.size) {
+            if (index < heavy.size && heavy[index]) {
+                if (start < 0) {
+                    start = index
+                    length = 0.0
+                }
+                length += TurfMeasurement.distance(
+                    line[before + index], line[before + index + 1], TurfConstants.UNIT_METERS)
+                continue
+            }
+            if (start >= 0) {
+                if (length >= TRAFFIC_TAG_MIN_RUN_M) {
+                    val run = LineString.fromLngLats(line.subList(before + start, before + index + 1))
+                    val middle = TurfMeasurement.along(run, length / 2, TurfConstants.UNIT_METERS)
+                    return middle to "+$minutes min · Heavy traffic"
+                }
+                start = -1
+            }
+        }
+        return null
+    }
+
+    /**
+     * For each piece of [leg]'s line, whether the traffic on it is heavy
+     * or worse. Null when the directions came without congestion.
+     */
+    private fun heavyPieces(leg: RouteLeg): List<Boolean>? {
+        val annotation = leg.annotation() ?: return null
+        val named: List<String?>? = annotation.congestion()
+        if (named != null) return named.map { it == "heavy" || it == "severe" }
+        // The navigation SDK asks for numbers in place of names, and a
+        // piece nothing is known about comes as null.
+        val numbered: List<Int?>? = annotation.congestionNumeric()
+        return numbered?.map { it != null && it >= HEAVY_CONGESTION_FROM }
+    }
+
+    /** How many pieces [leg]'s line has, going by whichever of its lists is there. */
+    private fun pieceCount(leg: RouteLeg): Int? {
+        val annotation = leg.annotation() ?: return null
+        return annotation.congestionNumeric()?.size
+            ?: annotation.congestion()?.size
+            ?: annotation.distance()?.size
+    }
+
+    /** Holds the following camera close as the next turn comes up. */
+    private fun closeInOnTurn(progress: RouteProgress) {
+        val leg = progress.currentLegProgress
+        val turn = leg?.upcomingStep?.maneuver()
+        // Arriving is not a turn: the door view frames that.
+        val distance = if (turn == null || turn.type() == "arrive") {
+            null
+        } else {
+            leg.currentStepProgress?.distanceRemaining?.toDouble()
+        }
+        val speed = this.lastLocation?.takeIf { it.hasSpeed() }?.speed?.toDouble() ?: 0.0
+        this.mapLook.closeInOnTurn(distance, speed)
     }
 
     /** Where the route in use passes a traffic light. */
@@ -921,7 +1249,7 @@ open class TurnByTurn(
                 }
             }
 
-            PluginUtilities.sendEvent(MapBoxEvents.NAV_STATE, state.toString())
+            this.sendEvent(MapBoxEvents.NAV_STATE, state.toString())
             offered
         } catch (_: java.lang.Exception) {
             // A state that fails to encode is skipped, never fatal.
@@ -944,6 +1272,16 @@ open class TurnByTurn(
             this.markDestination(progress)
         } catch (e: java.lang.Exception) {
             this.logDrawingFailureOnce("the pin at the stop", e)
+        }
+        try {
+            this.closeInOnTurn(progress)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the close view of the next turn", e)
+        }
+        try {
+            this.tagTraffic(progress)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the tag on heavy traffic", e)
         }
     }
 
@@ -970,8 +1308,12 @@ open class TurnByTurn(
                 this.distanceRemaining = routeProgress.distanceRemaining
                 this.durationRemaining = routeProgress.durationRemaining
 
-                val progressEvent = MapBoxRouteProgressEvent(routeProgress)
-                PluginUtilities.sendEvent(progressEvent)
+                // Not built at all for a host that does not want it:
+                // the building is the cost, not the sending.
+                if (this.progressEvents) {
+                    val progressEvent = MapBoxRouteProgressEvent(routeProgress)
+                    this.sendEvent(progressEvent)
+                }
                 this.lastProgress = routeProgress
                 this.emitNavState()
             } catch (_: java.lang.Exception) {
@@ -983,7 +1325,7 @@ open class TurnByTurn(
     private val arrivalObserver: ArrivalObserver = object : ArrivalObserver {
         override fun onFinalDestinationArrival(routeProgress: RouteProgress) {
             this@TurnByTurn.arrived = true
-            PluginUtilities.sendEvent(MapBoxEvents.ON_ARRIVAL)
+            this@TurnByTurn.sendEvent(MapBoxEvents.ON_ARRIVAL)
             this@TurnByTurn.emitNavState()
         }
 

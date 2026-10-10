@@ -46,6 +46,10 @@ class FlutterMapboxNavigationPlugin : FlutterPlugin, MethodCallHandler,
 
     companion object {
 
+        // The listener on the plugin's own channel, which is where the
+        // full-screen activity's events go. An embedded view has a
+        // channel and a listener of its own (see TurnByTurn) and neither
+        // reads nor fills this.
         var eventSink: EventChannel.EventSink? = null
 
         var PERMISSION_REQUEST_CODE: Int = 367

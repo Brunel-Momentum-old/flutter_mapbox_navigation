@@ -5,10 +5,10 @@ import android.content.Context
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import com.eopeter.fluttermapboxnavigation.MapLook
 import com.eopeter.fluttermapboxnavigation.TurnByTurn
 import com.eopeter.fluttermapboxnavigation.databinding.NavigationActivityBinding
 import com.eopeter.fluttermapboxnavigation.models.MapBoxEvents
-import com.eopeter.fluttermapboxnavigation.utilities.PluginUtilities
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.mapbox.geojson.Point
 import com.mapbox.maps.MapInitOptions
@@ -25,9 +25,6 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.platform.PlatformView
 import org.json.JSONObject
-
-/** What Mapbox's own navigation on iOS draws at on battery. */
-private const val MAP_FRAMES_PER_SECOND = 30
 
 class EmbeddedNavigationMapView(
     context: Context,
@@ -97,6 +94,10 @@ class EmbeddedNavigationMapView(
 
     open fun initialize() {
         initFlutterChannelHandlers()
+        // The options the view was made with say whether the host wants
+        // the progress event. The same options come again with the route
+        // and can change it then.
+        (this.arguments?.get("progressEvents") as? Boolean)?.let { progressEvents = it }
         host.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
             if (!dropInReady && (right - left) >= 200 && (bottom - top) >= 200) {
                 dropInReady = true
@@ -135,8 +136,9 @@ class EmbeddedNavigationMapView(
                         // Left alone the map draws at the display's rate,
                         // 90 or 120 a second on most phones, for the
                         // whole trip. Guidance does not need it and the
-                        // battery pays for it.
-                        setMaximumFps(MAP_FRAMES_PER_SECOND)
+                        // battery pays for it. From here on MapLook sets
+                        // the rate: this one moving, a lower one stopped.
+                        setMaximumFps(MapLook.MOVING_FPS)
                         // Drop-In makes a tapped alternative the route in
                         // use, with no question asked. The host offers a
                         // faster route in its own card and nothing may
@@ -207,13 +209,19 @@ class EmbeddedNavigationMapView(
         }
         this.binding.navigationView.unregisterMapObserver(mapLookObserver)
         releaseHeldCalls(run = false)
+        // The host ends a trip before it closes the screen. When it has
+        // not, or its call arrives after this view has gone and finds
+        // nobody to take it, the trip is ended here.
+        finishTripLeftRunning()
         unregisterObservers()
-        // Left set, the handler kept this view within reach of the
-        // engine for as long as the app ran. The event channel's handler
-        // is left as it is: the sink it fills is one slot shared by every
-        // view, and an old view's cancel already empties it under a
-        // newer one. That wants putting right before it is touched here.
+        // Left set, the handlers kept this view within reach of the
+        // engine for as long as the app ran. The event channel's is let
+        // go of by a stand-in that stays to answer the Dart side's
+        // cancel, which comes after this (see EventRelay). Its events go
+        // to this view's own listener now, so nothing done here can
+        // silence a newer view.
         methodChannel?.setMethodCallHandler(null)
+        releaseEventChannel()
     }
 
     private val onMapClick = object : MapViewObserver(), OnMapClickListener {
@@ -230,7 +238,7 @@ class EmbeddedNavigationMapView(
                 "latitude" to point.latitude().toString(),
                 "longitude" to point.longitude().toString(),
             )
-            PluginUtilities.sendEvent(MapBoxEvents.ON_MAP_TAP, JSONObject(waypoint).toString())
+            sendEvent(MapBoxEvents.ON_MAP_TAP, JSONObject(waypoint).toString())
             return false
         }
     }

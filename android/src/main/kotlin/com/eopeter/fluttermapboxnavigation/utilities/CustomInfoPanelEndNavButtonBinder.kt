@@ -13,7 +13,11 @@ import com.mapbox.navigation.ui.base.lifecycle.UIComponent
 import com.mapbox.navigation.ui.base.view.MapboxExtendableButton
 
 class CustomInfoPanelEndNavButtonBinder(
-    val activity: Activity
+    val activity: Activity,
+    // Who is told the button ended navigation. The full-screen activity's
+    // listener unless an embedded view passes its own: each view's events
+    // go to that view's listener and nobody else's.
+    private val send: (MapBoxEvents) -> Unit = { PluginUtilities.sendEvent(it) },
 ) : UIBinder {
     override fun bind(viewGroup: ViewGroup): MapboxNavigationObserver {
         val button = MapboxExtendableButton(
@@ -33,7 +37,7 @@ class CustomInfoPanelEndNavButtonBinder(
                 super.onAttached(mapboxNavigation)
                 button.setOnClickListener {
                     mapboxNavigation.stopTripSession()
-                    PluginUtilities.sendEvent(MapBoxEvents.NAVIGATION_CANCELLED)
+                    send(MapBoxEvents.NAVIGATION_CANCELLED)
                     activity.finish()
                 }
             }
