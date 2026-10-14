@@ -127,6 +127,11 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
                 strongSelf.setNightMode(arguments?["night"] as? Bool ?? false)
                 result(true)
             }
+            else if(call.method == "setMarker")
+            {
+                strongSelf.setMarker(DriverMarker(arguments: arguments))
+                result(true)
+            }
             else if(call.method == "setFasterRouteMinimumSaving")
             {
                 strongSelf._fasterRouteMinimumSaving = arguments?["seconds"] as? Double ?? defaultFasterRouteMinimumSaving

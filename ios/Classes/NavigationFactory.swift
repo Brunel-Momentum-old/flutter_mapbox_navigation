@@ -93,6 +93,12 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
 
     // Map look, stop pins and door view — see MapLook.swift.
     var _nightMode = false
+    /// The driver's marker, pin or truck — see TruckPuck.swift.
+    var _marker = DriverMarker()
+    var _truckFeed: TruckLocationFeed?
+    var _truckStyleWatch: Cancelable?
+    var _truckErrorWatch: Cancelable?
+    var _truckLayerCount = 0
     /// Which style the route line on the map was last coloured for.
     var _routeLineColouredForNight: Bool?
     /// What the house-number layer on the map was built for.
@@ -415,6 +421,12 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     /// just been taken down: the managers point at a map that is gone,
     /// and holding them kept that map alive.
     func releaseTripObjects() {
+        _truckFeed = nil
+        _truckLayerCount = 0
+        _truckStyleWatch?.cancel()
+        _truckStyleWatch = nil
+        _truckErrorWatch?.cancel()
+        _truckErrorWatch = nil
         _stopPinManager = nil
         _doorPointManager = nil
         _doorPolygonManager = nil
@@ -634,7 +646,10 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         updateDoorView()
         placeOrnaments()
         if _routeLook != "normal" { applyRouteLook() }
-        if let map = navigationViewController.navigationMapView { paceMap(map, at: location, phone: rawLocation) }
+        if let map = navigationViewController.navigationMapView {
+            moveTruck(on: map, to: location)
+            paceMap(map, at: location, phone: rawLocation)
+        }
     }
     
     public func navigationViewController(_ navigationViewController: NavigationViewController, didArriveAt waypoint: Waypoint) -> Bool {

@@ -287,6 +287,10 @@ open class TurnByTurn(
                 this.mapLook.setRouteLook(look, if (look == "left") this.routeStillAhead() else null)
                 result.success(true)
             }
+            "setMarker" -> {
+                this.mapLook.setMarker(DriverMarker.from(this.context, methodCall.arguments as? Map<*, *>))
+                result.success(true)
+            }
             "setNightMode" -> {
                 this.nightMode = methodCall.argument<Boolean>("night") ?: false
                 this.mapLook.night = this.nightMode

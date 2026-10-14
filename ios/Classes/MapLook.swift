@@ -127,6 +127,8 @@ extension NavigationFactory {
                let puck = view as? UserPuckCourseView {
                 HostMapColor.style(puck)
             }
+            // Or the truck, when the host chose it (TruckPuck.swift).
+            applyMarker(to: map)
         }
     }
 

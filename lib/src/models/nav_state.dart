@@ -237,6 +237,42 @@ enum NavRouteLook {
   left,
 }
 
+/// The driver's marker on the navigation map. See
+/// `MapBoxNavigationViewController.setMarker`.
+class NavMarker {
+  /// The SDK's pin.
+  const NavMarker.pin()
+      : truck = false,
+        modelAsset = null,
+        scale = null,
+        rotation = const [0, 0, 0];
+
+  /// A 3D model from the host's Flutter assets: a glTF binary in metres,
+  /// +Y up, front towards +Z, origin on the ground under its middle.
+  ///
+  /// [scale] is a Mapbox style expression for `model-scale` (an array of
+  /// three numbers by zoom). [rotation] is applied to the model before
+  /// the heading, in degrees `[x, y, z]`. If the model cannot be found
+  /// or loaded the plugin shows the pin instead.
+  const NavMarker.model({
+    required String this.modelAsset,
+    required List<Object> this.scale,
+    this.rotation = const [0, 0, 0],
+  }) : truck = true;
+
+  final bool truck;
+  final String? modelAsset;
+  final List<Object>? scale;
+  final List<double> rotation;
+
+  Map<String, Object?> toMap() => {
+        'marker': truck ? 'truck' : 'pin',
+        'modelAsset': modelAsset,
+        'scale': scale == null ? null : jsonEncode(scale),
+        'rotation': rotation,
+      };
+}
+
 /// A numbered pin for a stop, shown while the map is in overview.
 class NavStopPin {
   const NavStopPin({

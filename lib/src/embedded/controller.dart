@@ -200,6 +200,13 @@ class MapBoxNavigationViewController {
   Future<void> setNightMode({required bool night}) =>
       _methodChannel.invokeMethod<void>('setNightMode', {'night': night});
 
+  /// Draws the driver's position as [marker]: the pin or a 3D model.
+  /// Applied to the map at once if a trip is running, and to every trip
+  /// after. Never fails over a bad model: the plugin falls back to the
+  /// pin.
+  Future<void> setMarker(NavMarker marker) =>
+      _methodChannel.invokeMethod<void>('setMarker', marker.toMap());
+
   /// Draws the route as [look]: in its own colours, washed out while
   /// the driver's position is only the last one known, or grey and
   /// dashed once they have left it.

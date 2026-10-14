@@ -27,6 +27,8 @@ import com.mapbox.bindgen.Value
 import com.mapbox.maps.MapView
 import com.mapbox.maps.Style
 import com.mapbox.maps.plugin.delegates.listeners.OnStyleLoadedListener
+import com.mapbox.maps.plugin.delegates.listeners.OnMapLoadErrorListener
+import com.mapbox.maps.extension.observable.eventdata.MapLoadingErrorEventData
 import com.mapbox.maps.extension.style.expressions.dsl.generated.get
 import com.mapbox.maps.extension.style.expressions.dsl.generated.interpolate
 import com.mapbox.maps.extension.style.expressions.generated.Expression
@@ -175,6 +177,10 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         // The layer the SDK draws the driver's marker in.
         private const val PUCK_LAYER = "mapbox-location-indicator-layer"
 
+        // The layer the SDK draws the 3D truck in, when that is the marker.
+        private const val MODEL_PUCK_LAYER = "mapbox-location-model-layer"
+        private const val MODEL_PUCK_SOURCE = "mapbox-location-model-source"
+
         // The route line goes under the first of these the style has: under
         // street names where it can, and under the puck whatever happens.
         // Left to itself it was drawn last, on top of the puck.
@@ -183,6 +189,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             "road-label",
             "road-label-simple",
             PUCK_LAYER,
+            MODEL_PUCK_LAYER,
         )
     }
 
@@ -252,22 +259,80 @@ class MapLook(private val context: Context, private val navigationView: Navigati
 
     /** Route line colours and the puck. Call before guidance starts. */
     fun applyStyle() {
-        val puck = LocationPuck2D(
-            bearingImage = BitmapDrawable(context.resources, puckBitmap())
-        )
         routeLineResources = routeLineResources()
         navigationView.customizeViewOptions {
             routeLineOptions = routeLineOptions()
             enableBuildingHighlightOnArrival = false
         }
+        applyMarker()
         navigationView.customizeViewStyles {
-            locationPuckOptions = LocationPuckOptions.Builder(context)
-                .defaultPuck(puck)
-                .build()
             // The stop is marked with the host's own numbered pin, so
             // Drop-In's stock marker is swapped for nothing.
             destinationMarkerAnnotationOptions = PointAnnotationOptions()
                 .withIconImage(Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888))
+        }
+    }
+
+    // ---- the driver's marker: pin or truck (TruckPuck.kt) --------------
+
+    private var marker = DriverMarker()
+
+    /** The layer the driver's marker is drawn in, whichever it is. */
+    private fun puckLayer(style: Style): String? =
+        listOf(PUCK_LAYER, MODEL_PUCK_LAYER).firstOrNull { style.styleLayerExists(it) }
+
+    /** The host chose a marker: applied to the map now and kept for later. */
+    fun setMarker(next: DriverMarker) {
+        if (next == marker) return
+        marker = next
+        wakeMap()
+        applyMarker()
+    }
+
+    private fun pinPuck() = LocationPuck2D(
+        bearingImage = BitmapDrawable(context.resources, puckBitmap())
+    )
+
+    /**
+     * Hands Drop-In the marker. Whatever goes wrong with the truck, the
+     * driver gets the pin: never an exception out of here, never no marker.
+     */
+    private fun applyMarker() {
+        val puck = marker.puck3D() ?: pinPuck()
+        try {
+            navigationView.customizeViewStyles {
+                locationPuckOptions = LocationPuckOptions.Builder(context)
+                    .defaultPuck(puck)
+                    .build()
+            }
+        } catch (t: Throwable) {
+            Log.w("MapLook", "marker could not be set; using the pin", t)
+            if (puck is LocationPuck2D) return
+            marker = marker.copy(truck = false)
+            try {
+                navigationView.customizeViewStyles {
+                    locationPuckOptions = LocationPuckOptions.Builder(context)
+                        .defaultPuck(pinPuck())
+                        .build()
+                }
+            } catch (t2: Throwable) {
+                Log.w("MapLook", "pin could not be set either", t2)
+            }
+        }
+    }
+
+    /** The model would not load: the pin, never no marker. */
+    private val modelLoadError = object : OnMapLoadErrorListener {
+        override fun onMapLoadError(eventData: MapLoadingErrorEventData) {
+            if (!marker.showsTruck) return
+            val message = eventData.message
+            val aboutModel = eventData.sourceId == MODEL_PUCK_SOURCE ||
+                message.contains("gltf", ignoreCase = true) ||
+                message.contains("model", ignoreCase = true)
+            if (!aboutModel) return
+            Log.w("MapLook", "truck marker failed to load ($message); using the pin")
+            marker = marker.copy(truck = false)
+            applyMarker()
         }
     }
 
@@ -324,6 +389,8 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     }
 
     fun onMapAttached(view: MapView) {
+        mapView?.getMapboxMap()?.removeOnMapLoadErrorListener(modelLoadError)
+        view.getMapboxMap().addOnMapLoadErrorListener(modelLoadError)
         mapView = view
         buildingsApi = MapboxBuildingsApi(view.getMapboxMap())
         pinManager = null
@@ -378,6 +445,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
 
     fun onMapDetached() {
         mapView?.getMapboxMap()?.removeOnStyleLoadedListener(styleLoaded)
+        mapView?.getMapboxMap()?.removeOnMapLoadErrorListener(modelLoadError)
         // A map let go of while resting is not left at the resting rate.
         resetPace()
         mapView?.let { stopWatchingTouches(it) }
@@ -479,7 +547,8 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }
         // Under the driver's marker where there is one. Added last, a
         // light was drawn over the driver waiting at it.
-        if (style.styleLayerExists(PUCK_LAYER)) style.addLayerBelow(layer, PUCK_LAYER) else style.addLayer(layer)
+        val puck = puckLayer(style)
+        if (puck != null) style.addLayerBelow(layer, puck) else style.addLayer(layer)
     }
 
     // ---- tags on the map: the next turn, and a faster route -----------
@@ -540,8 +609,8 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             // route the two are in the same place, and the marker is the
             // one that has to show. On top, the pin hid it.
             val underMarker = view.getMapboxMap().getStyle()
-                ?.takeIf { it.styleLayerExists(PUCK_LAYER) }
-                ?.let { AnnotationConfig(belowLayerId = PUCK_LAYER) }
+                ?.let { puckLayer(it) }
+                ?.let { AnnotationConfig(belowLayerId = it) }
             view.annotations.createPointAnnotationManager(underMarker).also {
                 // The arrow is a direction on the ground: it turns with
                 // the map, and no label may hide it.
