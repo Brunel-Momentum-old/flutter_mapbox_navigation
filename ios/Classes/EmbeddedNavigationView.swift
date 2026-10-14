@@ -327,6 +327,9 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
             strongSelf.routeResponse = response
             strongSelf.selectedRouteIndex = 0
             strongSelf.sendEvent(eventType: MapBoxEventType.route_built, data: strongSelf.encodeRouteResponse(response: response))
+            // The map under the trip is always the day one, whatever the
+            // last trip left the route colours at.
+            if let base = strongSelf.navigationMapView { HostMapColor.style(base, night: false) }
             strongSelf.navigationMapView?.showcase(routes, routesPresentationStyle: .all(shouldFit: true), animated: true)
             flutterResult(true)
         }

@@ -454,9 +454,9 @@ open class TurnByTurn(
         // Nor its traffic.
         this.clearTrafficTag()
         // Nor is how long the driver stood before it, or the turn the
-        // camera was last holding close.
+        // camera was last looking down on.
         this.mapLook.resetPace()
-        this.mapLook.closeInOnTurn(null, 0.0)
+        this.mapLook.dropTurnView()
         this.binding.navigationView.api.startActiveGuidance(this.currentRoutes!!)
         this.sendEvent(MapBoxEvents.NAVIGATION_RUNNING)
     }
@@ -470,9 +470,9 @@ open class TurnByTurn(
         MapboxNavigationApp.current()?.setNavigationRoutes(emptyList())
         // No route, no progress to say the tunnel has ended.
         this.locationEngine?.inTunnel = false
-        // Nor any to say the turn the camera was holding close is past,
+        // Nor any to say the turn the camera was looking down on is past,
         // or to take the traffic tag off a route that is no longer there.
-        this.mapLook.closeInOnTurn(null, 0.0)
+        this.mapLook.dropTurnView()
         this.clearTrafficTag()
         this.guidanceStarted = false
         this.isNavigationCanceled = true
@@ -871,6 +871,7 @@ open class TurnByTurn(
     private fun applyHostPadding() {
         val padding = this.hostPadding ?: return
         this.mapLook.hostPadding = padding
+        this.mapLook.cameraPadding = cameraPadding(padding)
         SharedApp.store.dispatch(CameraAction.UpdatePadding(cameraPadding(padding)))
     }
 
@@ -1100,18 +1101,49 @@ open class TurnByTurn(
             ?: annotation.distance()?.size
     }
 
-    /** Holds the following camera close as the next turn comes up. */
-    private fun closeInOnTurn(progress: RouteProgress) {
+    /**
+     * Takes the camera straight down as the next turn comes up, and back
+     * once past it. What counts as a turn, and when, is in [TurnView].
+     */
+    private fun frameTurn(progress: RouteProgress) {
         val leg = progress.currentLegProgress
+        val step = leg?.currentStepProgress
         val turn = leg?.upcomingStep?.maneuver()
-        // Arriving is not a turn: the door view frames that.
-        val distance = if (turn == null || turn.type() == "arrive") {
-            null
-        } else {
-            leg.currentStepProgress?.distanceRemaining?.toDouble()
+        // Off the route there is no turn to trust.
+        val guiding = !this.offRoute && !this.rerouting
+        val choice = guiding && TurnView.needsChoice(turn?.type(), turn?.modifier())
+        val ahead = ArrayList<Point>()
+        if (choice && step != null) {
+            // The road from the driver to the turn, and the first
+            // stretch after it.
+            val points = step.stepPoints.orEmpty()
+            if (points.size >= 2) {
+                val line = LineString.fromLngLats(points)
+                val length = TurfMeasurement.length(line, TurfConstants.UNIT_METERS)
+                val driven = step.distanceTraveled.toDouble().coerceIn(0.0, length)
+                ahead.addAll(
+                    TurfMisc.lineSliceAlong(line, driven, length, TurfConstants.UNIT_METERS).coordinates()
+                )
+            }
+            val after = progress.upcomingStepPoints.orEmpty()
+            if (after.size >= 2) {
+                ahead.addAll(
+                    TurfMisc.lineSliceAlong(
+                        LineString.fromLngLats(after), 0.0, TurnView.FRAME_AFTER_METRES, TurfConstants.UNIT_METERS,
+                    ).coordinates()
+                )
+            }
         }
-        val speed = this.lastLocation?.takeIf { it.hasSpeed() }?.speed?.toDouble() ?: 0.0
-        this.mapLook.closeInOnTurn(distance, speed)
+        this.mapLook.frameTurn(
+            stepKey = (leg?.legIndex ?: 0) * 10_000 + (step?.stepIndex ?: 0),
+            needsChoice = choice,
+            distanceToTurn = step?.distanceRemaining?.toDouble(),
+            distanceIntoStep = if (guiding) step?.distanceTraveled?.toDouble() ?: Double.POSITIVE_INFINITY
+            else Double.POSITIVE_INFINITY,
+            speed = this.lastLocation?.takeIf { it.hasSpeed() }?.speed?.toDouble() ?: 0.0,
+            location = this.lastLocation,
+            ahead = ahead,
+        )
     }
 
     /** Where the route in use passes a traffic light. */
@@ -1274,9 +1306,9 @@ open class TurnByTurn(
             this.logDrawingFailureOnce("the pin at the stop", e)
         }
         try {
-            this.closeInOnTurn(progress)
+            this.frameTurn(progress)
         } catch (e: java.lang.Exception) {
-            this.logDrawingFailureOnce("the close view of the next turn", e)
+            this.logDrawingFailureOnce("the bird's-eye view of the next turn", e)
         }
         try {
             this.tagTraffic(progress)

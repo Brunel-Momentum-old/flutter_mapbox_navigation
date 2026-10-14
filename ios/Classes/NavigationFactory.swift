@@ -93,6 +93,19 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
 
     // Map look, stop pins and door view — see MapLook.swift.
     var _nightMode = false
+    /// Which style the route line on the map was last coloured for.
+    var _routeLineColouredForNight: Bool?
+    /// What the house-number layer on the map was built for.
+    var _houseNumbersKey: String?
+
+    // Bird's-eye view at a turn — see TurnView.swift and `frameTurn`.
+    var _turnView = TurnView.State()
+    /// The tilt and zoom the following camera is being held at, while
+    /// the host has them. Nil while the SDK has its camera.
+    var _turnPitch: Double?
+    var _turnZoom: Double?
+    var _turnZoomTarget: Double?
+    var _turnViewAt: Date?
     var _stopPins: [[String: Any]] = []
     var _stopPinManager: PointAnnotationManager?
     var _doorView: DoorView?
@@ -418,6 +431,13 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _fasterRouteOnMap = nil
         _routeLook = "normal"
         _doorView = nil
+        _routeLineColouredForNight = nil
+        _houseNumbersKey = nil
+        _turnView = TurnView.State()
+        _turnPitch = nil
+        _turnZoom = nil
+        _turnZoomTarget = nil
+        _turnViewAt = nil
         _lastProgress = nil
         _stillTicks = 0
         _lastTickLocation = nil

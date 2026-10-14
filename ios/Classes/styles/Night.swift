@@ -32,6 +32,6 @@ class CustomNightStyle: NightStyle {
 
     override func apply() {
         super.apply()
-        HostMapColor.applyRouteLine()
+        HostMapColor.applyRouteLine(night: true)
     }
 }

@@ -246,7 +246,8 @@ extension NavigationFactory {
         showFasterRouteOnMap(!_offRoute && !_rerouting ? fasterAlternative() : nil)
         tagNextTurn(progress)
         markDestination(progress)
-        closeInOnTurn(progress)
+        frameTurn(progress)
+        if _routeLineColouredForNight != _nightMode { colourRouteLine() }
         tagTraffic(progress)
         drawTrafficLights()
         guard let data = try? JSONSerialization.data(withJSONObject: navState(for: progress), options: []),

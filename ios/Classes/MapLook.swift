@@ -14,40 +14,54 @@ enum HostMapColor {
     static let trafficModerate = UIColor(red: 0xF0 / 255.0, green: 0xA9 / 255.0, blue: 0x1B / 255.0, alpha: 1)
     static let trafficHeavy = UIColor(red: 0xC8 / 255.0, green: 0x40 / 255.0, blue: 0x2F / 255.0, alpha: 1)
     static let trafficSevere = UIColor(red: 0x9E / 255.0, green: 0x33 / 255.0, blue: 0x25 / 255.0, alpha: 1)
-    static let travelled = UIColor(red: 0xB9 / 255.0, green: 0xB6 / 255.0, blue: 0xAE / 255.0, alpha: 1)
+    /// The part of the route already driven: the route's own blue,
+    /// faded towards the map it lies on. Pale on the day map, dim on
+    /// the night one.
+    static let travelledDay = UIColor(red: 0xA9 / 255.0, green: 0xBF / 255.0, blue: 0xEC / 255.0, alpha: 1)
+    static let travelledNight = UIColor(red: 0x2E / 255.0, green: 0x3F / 255.0, blue: 0x66 / 255.0, alpha: 1)
+    /// The edge of the route line. White lifts it off the day map; on
+    /// the night map a white edge glared, so it is a deeper blue there.
+    static let casingDay = UIColor.white
+    static let casingNight = UIColor(red: 0x12 / 255.0, green: 0x2F / 255.0, blue: 0x78 / 255.0, alpha: 1)
     static let green = UIColor(red: 0x2B / 255.0, green: 0x73 / 255.0, blue: 0x48 / 255.0, alpha: 1)
     static let buildingFill = UIColor(red: 0xBF / 255.0, green: 0xDC / 255.0, blue: 0xCB / 255.0, alpha: 1)
     static let ink = UIColor(red: 0x2B / 255.0, green: 0x2B / 255.0, blue: 0x2B / 255.0, alpha: 1)
     static let leftRoute = UIColor(red: 0x8E / 255.0, green: 0x8B / 255.0, blue: 0x83 / 255.0, alpha: 1)
     static let tip = UIColor(red: 0x1E / 255.0, green: 0x1E / 255.0, blue: 0x1C / 255.0, alpha: 1)
 
-    /// As close as the following camera comes at a turn. The camera is
-    /// tilted, so it sees a long way ahead for its zoom: at the SDK's own
-    /// limit (16.35) a junction 30 m off was a few points across.
-    static let closestZoom = 18.75
     static let tipGreen = UIColor(red: 0x1F / 255.0, green: 0x5A / 255.0, blue: 0x37 / 255.0, alpha: 1)
 
     /// Route line, casing, traffic and puck colours, applied through the
     /// appearance proxy by the day and night styles. Set per idiom, the
     /// way the SDK's own styles do it: a trait-specific proxy outranks
     /// the global one, so a global value would lose to the SDK default.
-    static func applyRouteLine() {
+    static func applyRouteLine(night: Bool) {
         let traitCollections = [UITraitCollection(userInterfaceIdiom: .phone),
                                 UITraitCollection(userInterfaceIdiom: .pad)]
         for traits in traitCollections {
-            style(NavigationMapView.appearance(for: traits))
+            style(NavigationMapView.appearance(for: traits), night: night)
             style(UserPuckCourseView.appearance(for: traits))
         }
     }
 
-    static func style(_ map: NavigationMapView) {
+    /// A colour as a style layer property takes it.
+    static func css(_ color: UIColor) -> String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return "rgba(\(Int((r * 255).rounded())), \(Int((g * 255).rounded())), \(Int((b * 255).rounded())), \(a))"
+    }
+
+    static func casing(night: Bool) -> UIColor { night ? casingNight : casingDay }
+    static func travelled(night: Bool) -> UIColor { night ? travelledNight : travelledDay }
+
+    static func style(_ map: NavigationMapView, night: Bool) {
         map.trafficUnknownColor = route
         map.trafficLowColor = route
         map.trafficModerateColor = trafficModerate
         map.trafficHeavyColor = trafficHeavy
         map.trafficSevereColor = trafficSevere
-        map.routeCasingColor = .white
-        map.traversedRouteColor = travelled
+        map.routeCasingColor = casing(night: night)
+        map.traversedRouteColor = travelled(night: night)
         map.maneuverArrowColor = .white
         map.maneuverArrowStrokeColor = route
         map.buildingHighlightColor = buildingFill
@@ -92,14 +106,10 @@ extension NavigationFactory {
             // the turn, taking the marker off its spot.
             if let viewport = map.navigationCamera.viewportDataSource as? NavigationViewportDataSource {
                 viewport.options.followingCameraOptions.bearingSmoothing.enabled = false
+                // The SDK's own flat view near a turn is off: the
+                // bird's-eye view at a turn is the host's (`frameTurn`),
+                // which keeps the marker where it is.
                 viewport.options.followingCameraOptions.pitchNearManeuver.enabled = false
-                // The camera closes in as a turn comes up, but the SDK
-                // stops it at a zoom where the screen still shows 600 m:
-                // 30 m from a junction the lanes and the turn itself were
-                // a few points across. Let it come in to where the
-                // junction fills the screen.
-                let zoom = viewport.options.followingCameraOptions.zoomRange
-                viewport.options.followingCameraOptions.zoomRange = zoom.lowerBound...HostMapColor.closestZoom
             }
             // The host offers a faster route in its own card; the SDK's
             // "2 min slower" bubbles on every alternative are noise.
@@ -107,7 +117,7 @@ extension NavigationFactory {
             // And nothing switches route without that card: left alone,
             // a tap anywhere near an alternative's line took it.
             map.tapGestureDistanceThreshold = 0
-            HostMapColor.style(map)
+            HostMapColor.style(map, night: _nightMode)
             // The SDK's own marker view, in a kind that animates at the
             // map's rate (see PacedPuckView).
             if case let .courseView(view)? = map.userLocationStyle, !(view is PacedPuckView) {
@@ -131,6 +141,42 @@ extension NavigationFactory {
         _shownTags = ""
         _shownDestinationPin = nil
         _trafficLightsDrawnAt = nil
+        _routeLineColouredForNight = nil
+        _houseNumbersKey = nil
+        colourRouteLine()
+    }
+
+    // MARK: Route line colours, day and night
+
+    /// Gives the route line on the map the colours of the style in use.
+    ///
+    /// The SDK reads the colours when it first draws a route and keeps
+    /// the layers through a change of style, so a trip that ran from day
+    /// into night kept its white edge on the dark map. The layers that
+    /// are there are recoloured in place; ones drawn later (a re-route)
+    /// take the colours from the map view.
+    func colourRouteLine() {
+        guard let map = _navigationViewController?.navigationMapView else { return }
+        HostMapColor.style(map, night: _nightMode)
+        let style = map.mapView.mapboxMap.style
+        let casing = HostMapColor.css(HostMapColor.casing(night: _nightMode))
+        let travelled = HostMapColor.css(HostMapColor.travelled(night: _nightMode))
+        var found = false
+        for id in style.allLayerIdentifiers.map({ $0.id }) {
+            if id.hasSuffix(".main.route_line_casing") {
+                found = true
+                // The casing is drawn with a gradient, which outranks
+                // its plain colour.
+                let gradient: [Any] = ["interpolate", ["linear"], ["line-progress"], 0, casing, 1, casing]
+                try? style.setLayerProperty(for: id, property: "line-gradient", value: gradient)
+                try? style.setLayerProperty(for: id, property: "line-color", value: casing)
+            } else if id.hasSuffix(".traversed_route") {
+                try? style.setLayerProperty(for: id, property: "line-color", value: travelled)
+            }
+        }
+        // Until the route has been drawn there is nothing to recolour,
+        // and the next tick tries again.
+        if found { _routeLineColouredForNight = _nightMode }
     }
 
     // MARK: Tags on the map: the next turn, and a faster route
@@ -251,39 +297,162 @@ extension NavigationFactory {
         return nil
     }
 
-    // MARK: Closing in on a turn
+    // MARK: Bird's-eye view at a turn
 
-    /// Holds the following camera close as a turn comes up.
+    /// Takes the following camera straight down as a turn comes up, and
+    /// back to its tilt once past it. Runs on every progress tick. When
+    /// and how close is decided in `TurnView`; this reads the trip and
+    /// moves the camera.
     ///
-    /// The SDK works the zoom out from how much road is left before the
-    /// turn, and it does come in, but not reliably: a short street, or a
-    /// run of junctions, and it was still showing several blocks with the
-    /// turn 30 m away. So the least zoom it may use is raised as the
-    /// turn nears, from the SDK's own closest at 200 m to nearly the
-    /// closest allowed (`HostMapColor.closestZoom`) inside 60 m. On a
-    /// fast road the turn arrives sooner, so both distances are at least
-    /// a few seconds of driving: at 100 km/h it starts 330 m out and is
-    /// fully in by 110 m. Arriving is not a turn; the door view frames
-    /// that.
-    func closeInOnTurn(_ progress: RouteProgress) {
+    /// The SDK's following camera goes on placing the driver and turning
+    /// the map: only its tilt and its zoom are taken over, and only from
+    /// the moment the view starts to come up until it is fully back. The
+    /// SDK moves the camera to whatever it is given over the second
+    /// between two ticks, so a target that changes a little each tick is
+    /// a smooth move on screen.
+    ///
+    /// This replaces the earlier "close in on a turn", which raised the
+    /// tilted camera's least zoom as a turn neared: two rules moving one
+    /// zoom fought each other.
+    func frameTurn(_ progress: RouteProgress) {
+        guard let map = _navigationViewController?.navigationMapView,
+              let viewport = map.navigationCamera.viewportDataSource as? NavigationViewportDataSource else { return }
+        let now = Date()
+        let elapsed = min(1.5, max(0.2, _turnViewAt.map { now.timeIntervalSince($0) } ?? 1.0))
+        _turnViewAt = now
+
+        let leg = progress.currentLegProgress
+        let stepProgress = leg.currentStepProgress
+        let upcoming = leg.upcomingStep
+        // Off the route there is no turn to trust, and the door view has
+        // the camera to itself.
+        let guiding = !_offRoute && !_rerouting && _doorView == nil
+        let choice = guiding && TurnView.needsChoice(type: upcoming?.maneuverType.rawValue,
+                                                     modifier: upcoming?.maneuverDirection?.rawValue)
+        let wasTopDown = _turnView.topDown
+        _turnView = TurnView.next(_turnView,
+                                  stepKey: progress.legIndex * 10_000 + leg.stepIndex,
+                                  needsChoice: choice,
+                                  distanceToManeuver: stepProgress.distanceRemaining,
+                                  distanceIntoStep: guiding ? stepProgress.distanceTraveled : .infinity,
+                                  speed: _lastKnownLocation?.speed ?? 0)
+        if _turnView.topDown != wasTopDown {
+            navTrace("turn view \(_turnView.topDown ? "up" : "down") toManeuver=\(Int(stepProgress.distanceRemaining)) speed=\(String(format: "%.1f", _lastKnownLocation?.speed ?? 0))")
+            wakeMap()
+        }
+
+        let tilt = viewport.options.followingCameraOptions.defaultPitch
+        // The SDK has the camera and nothing is asked of it.
+        if !_turnView.topDown && _turnPitch == nil { return }
+
+        let following = map.navigationCamera.state == .following
+        let camera = map.mapView.cameraState
+        var pitch = _turnPitch ?? Double(camera.pitch)
+        var zoom = _turnZoom ?? Double(camera.zoom)
+        var zoomTarget = zoom
+        if _turnView.topDown {
+            // While the turn is ahead the zoom follows it in. Through
+            // the turn and just past it, it stays where it was: what is
+            // ahead then is the whole of the next street.
+            if choice, _turnView.stepKey == progress.legIndex * 10_000 + leg.stepIndex,
+               let fitted = turnZoom(progress, in: map) {
+                _turnZoomTarget = fitted
+            }
+            zoomTarget = _turnZoomTarget ?? zoom
+        } else {
+            // Back to where the SDK's own zoom takes over without a jump.
+            zoomTarget = min(zoom, TurnView.tiltedClosestZoom)
+        }
+        let pitchTarget = _turnView.topDown ? 0 : tilt
+        if following {
+            pitch = TurnView.step(from: pitch, to: pitchTarget, most: tilt / TurnView.easeSeconds * elapsed)
+            zoom = TurnView.step(from: zoom, to: zoomTarget, most: TurnView.zoomPerSecond * elapsed)
+        } else {
+            // Nobody is watching the following camera (the overview, a
+            // map the driver has moved, the door view): it is simply
+            // where it should be when they come back to it.
+            pitch = pitchTarget
+            zoom = zoomTarget
+        }
+
+        if !_turnView.topDown && pitch == pitchTarget && zoom == zoomTarget {
+            // Fully back: the SDK has its camera again.
+            _turnPitch = nil
+            _turnZoom = nil
+            _turnZoomTarget = nil
+            viewport.options.followingCameraOptions.pitchUpdatesAllowed = true
+            viewport.options.followingCameraOptions.zoomUpdatesAllowed = true
+            return
+        }
+        _turnPitch = pitch
+        _turnZoom = zoom
+        navTrace("turn view pitch=\(Int(pitch)) zoom=\(String(format: "%.2f", zoom)) zoomTarget=\(String(format: "%.2f", zoomTarget)) map pitch=\(Int(camera.pitch)) zoom=\(String(format: "%.2f", camera.zoom))")
+        viewport.options.followingCameraOptions.pitchUpdatesAllowed = false
+        viewport.options.followingCameraOptions.zoomUpdatesAllowed = false
+        viewport.followingMobileCamera.pitch = CGFloat(pitch)
+        viewport.followingMobileCamera.zoom = CGFloat(zoom)
+        // The SDK turns its camera with the road only while it has the
+        // zoom as well (MapboxNavigation 2.21 checks the one to set the
+        // other), so the heading is kept up here: left to it, the map
+        // stayed pointing the way the van came out of the turn.
+        if let course = _lastKnownLocation?.course, course >= 0 {
+            viewport.followingMobileCamera.bearing = course
+        }
+        // To the camera now, not at the SDK's next tick: a second late,
+        // the map turned a second behind the van.
+        if following {
+            map.navigationCamera.viewportDataSource(viewport,
+                                                    didUpdate: [CameraOptions.followingMobileCamera: viewport.followingMobileCamera])
+        }
+    }
+
+    /// The bird's-eye zoom that has the driver, the turn and the first
+    /// stretch after it between the host's banner and its sheet.
+    private func turnZoom(_ progress: RouteProgress, in map: NavigationMapView) -> Double? {
+        guard let location = _lastKnownLocation else { return nil }
+        let leg = progress.currentLegProgress
+        let stepProgress = leg.currentStepProgress
+        var line: [CLLocationCoordinate2D] = []
+        if let shape = leg.currentStep.shape,
+           let rest = shape.trimmed(from: stepProgress.distanceTraveled, to: shape.distance() ?? 0) {
+            line += rest.coordinates
+        }
+        if let after = leg.upcomingStep?.shape?.trimmed(from: 0, to: TurnView.frameAfterMetres) {
+            line += after.coordinates
+        }
+        guard !line.isEmpty else { return nil }
+        let heading = (location.course >= 0 ? location.course : map.mapView.cameraState.bearing) * .pi / 180
+        let here = location.coordinate
+        let northMetres = 111_320.0
+        let eastMetres = northMetres * cos(here.latitude * .pi / 180)
+        let points = line.map { coordinate -> (ahead: Double, side: Double) in
+            let north = (coordinate.latitude - here.latitude) * northMetres
+            let east = (coordinate.longitude - here.longitude) * eastMetres
+            return (ahead: east * sin(heading) + north * cos(heading),
+                    side: east * cos(heading) - north * sin(heading))
+        }
+        let bounds = map.mapView.bounds
+        // The SDK keeps the marker this far above the host's sheet.
+        let markerAboveSheet: CGFloat = 92
+        let ahead = bounds.height - _cameraPaddingTop - _cameraPaddingBottom - markerAboveSheet
+        return TurnView.fitZoom(points: points,
+                                aheadPoints: Double(max(120, ahead)),
+                                halfWidthPoints: Double(bounds.width / 2 - 16),
+                                latitude: here.latitude)
+    }
+
+    /// Hands the camera back to the SDK at once: for the door view,
+    /// which drives the map by hand, and for a trip that has ended.
+    func dropTurnView() {
+        _turnView = TurnView.State()
+        _turnPitch = nil
+        _turnZoom = nil
+        _turnZoomTarget = nil
+        _turnViewAt = nil
         guard let viewport = _navigationViewController?.navigationMapView?.navigationCamera
             .viewportDataSource as? NavigationViewportDataSource else { return }
-        let far = 10.5, sdkClosest = 16.35, near = HostMapColor.closestZoom - 0.25
-        var least = far
-        if let step = progress.currentLegProgress.upcomingStep, step.maneuverType != .arrive {
-            let distance = progress.currentLegProgress.currentStepProgress.distanceRemaining
-            let speed = max(0, _lastKnownLocation?.speed ?? 0)
-            let begin = max(200, speed * 12)
-            let closest = max(60, speed * 4)
-            if distance <= closest {
-                least = near
-            } else if distance <= begin {
-                least = sdkClosest + (begin - distance) / (begin - closest) * (near - sdkClosest)
-            }
-        }
-        let range = viewport.options.followingCameraOptions.zoomRange
-        guard abs(range.lowerBound - least) > 0.05 || range.upperBound != HostMapColor.closestZoom else { return }
-        viewport.options.followingCameraOptions.zoomRange = least...HostMapColor.closestZoom
+        viewport.options.followingCameraOptions.pitchUpdatesAllowed = true
+        viewport.options.followingCameraOptions.zoomUpdatesAllowed = true
     }
 
     // MARK: Where the stop is, at the end of the route
@@ -408,7 +577,7 @@ extension NavigationFactory {
         try? style.addSource(source, id: id)
         var casing = LineLayer(id: id + "-casing")
         casing.source = id
-        casing.lineColor = .constant(StyleColor(.white))
+        casing.lineColor = .constant(StyleColor(_nightMode ? HostMapColor.tipGreen : .white))
         casing.lineWidth = .constant(12)
         casing.lineCap = .constant(.round)
         casing.lineJoin = .constant(.round)
@@ -721,6 +890,7 @@ extension NavigationFactory {
                              coordinate: coordinate,
                              label: arguments?["label"] as? String)
         if entering {
+            dropTurnView()
             map.navigationCamera.stop()
             refreshStopPins()
         }
@@ -804,6 +974,11 @@ extension NavigationFactory {
                 // over it: a number tag on top hid the very house the
                 // driver is looking for. The tag marks the spot only
                 // while there is no building to light.
+                //
+                // The number itself is always there, though: as a small
+                // badge on the building once it is lit, since the map's
+                // own number for it cannot be counted on (see
+                // `addHouseNumbers`).
                 self.showDoorMarker(at: destination, label: current.label,
                                     ring: !found && attempt >= 4, tag: !found)
             }
@@ -840,7 +1015,10 @@ extension NavigationFactory {
             _doorPolygonManager = mapView.annotations.makePolygonAnnotationManager(id: "host-door-ring")
         }
         if _doorPointManager == nil {
-            _doorPointManager = mapView.annotations.makePointAnnotationManager(id: "host-door-marker")
+            let manager = mapView.annotations.makePointAnnotationManager(id: "host-door-marker")
+            // The stop's own number: no other label may push it off.
+            manager.iconAllowOverlap = true
+            _doorPointManager = manager
         }
         if ring {
             var polygon = PolygonAnnotation(polygon: Polygon([Self.circle(around: coordinate, radius: 15)]))
@@ -851,14 +1029,19 @@ extension NavigationFactory {
         } else {
             _doorPolygonManager?.annotations = []
         }
-        guard tag else {
+        var marker = PointAnnotation(coordinate: coordinate)
+        let text = (label ?? "").trimmingCharacters(in: .whitespaces)
+        if tag {
+            marker.image = .init(image: Self.doorMarkerImage(label: text), name: "host-door-\(text)")
+            marker.iconAnchor = .bottom
+        } else if !text.isEmpty {
+            // The building is lit: its number sits on it, small enough
+            // to leave the building in view.
+            marker.image = .init(image: Self.doorBadgeImage(label: text), name: "host-door-badge-\(text)")
+        } else {
             _doorPointManager?.annotations = []
             return
         }
-        var marker = PointAnnotation(coordinate: coordinate)
-        let text = (label ?? "").trimmingCharacters(in: .whitespaces)
-        marker.image = .init(image: Self.doorMarkerImage(label: text), name: "host-door-\(text)")
-        marker.iconAnchor = .bottom
         _doorPointManager?.annotations = [marker]
     }
 
@@ -898,22 +1081,103 @@ extension NavigationFactory {
         }
     }
 
+    /// The stop's house number on the lit building: a small green pill
+    /// with a white edge, the same on the day and the night map.
+    static func doorBadgeImage(label: String) -> UIImage {
+        let font = UIFont.systemFont(ofSize: 16, weight: .bold)
+        let text = NSAttributedString(string: label, attributes: [.font: font, .foregroundColor: UIColor.white])
+        let textSize = text.size()
+        let pill = CGSize(width: max(34, textSize.width + 16), height: 26)
+        let size = CGSize(width: pill.width + 6, height: pill.height + 6)
+        return UIGraphicsImageRenderer(size: size).image { context in
+            let cg = context.cgContext
+            let rect = CGRect(x: 3, y: 3, width: pill.width, height: pill.height)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: pill.height / 2)
+            cg.setShadow(offset: CGSize(width: 0, height: 1), blur: 2, color: UIColor.black.withAlphaComponent(0.3).cgColor)
+            HostMapColor.green.setFill()
+            path.fill()
+            cg.setShadow(offset: .zero, blur: 0, color: nil)
+            UIColor.white.setStroke()
+            path.lineWidth = 2
+            path.stroke()
+            text.draw(at: CGPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2))
+        }
+    }
+
     /// House numbers on every building, from the street data the base
     /// style already carries but does not draw.
+    ///
+    /// Runs on every tick of the door view. Three things used to lose
+    /// numbers:
+    ///
+    /// - The lit building is a layer the SDK adds on top of everything
+    ///   when it finds the building, after this layer: the stop's own
+    ///   number was under a fill that is all but opaque. This layer is
+    ///   kept above it.
+    /// - Numbers that touch are dropped by the map, and at the zoom the
+    ///   door view starts at, with 15-point text, the houses of a terrace
+    ///   were close enough for every other one to go. The text is
+    ///   smaller further out and has less room kept round it.
+    /// - Not every building has a number in the map's data at all.
+    ///
+    /// The last cannot be fixed from here, so the stop's own number does
+    /// not rely on this layer: the host draws it (`showDoorMarker`), and
+    /// the map's number for the same house is left out so it is not
+    /// there twice.
+    /// Every house number but the stop's own: the same number within
+    /// `ownNumberMetres` of the stop. Further off it is another house's
+    /// (or the stop's pin is not on its house), and stays.
+    static func notTheStopsNumber(_ number: String, at stop: CLLocationCoordinate2D) -> Exp? {
+        let ownNumberMetres = 30.0
+        let dLat = ownNumberMetres / 111_320.0
+        let dLng = ownNumberMetres / (111_320.0 * cos(stop.latitude * .pi / 180))
+        let (s, n, w, e) = (stop.latitude - dLat, stop.latitude + dLat, stop.longitude - dLng, stop.longitude + dLng)
+        let filter: [Any] = ["!", ["all",
+                                   ["==", ["to-string", ["get", "house_num"]], number],
+                                   ["within", ["type": "Polygon",
+                                               "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]] as [String: Any]]]]
+        guard let data = try? JSONSerialization.data(withJSONObject: filter) else { return nil }
+        return try? JSONDecoder().decode(Exp.self, from: data)
+    }
+
     private func addHouseNumbers(to mapView: MapView) {
         let style = mapView.mapboxMap.style
         let layerId = "host-house-numbers"
-        guard !style.layerExists(withId: layerId), style.sourceExists(withId: "composite") else { return }
-        var layer = SymbolLayer(id: layerId)
-        layer.source = "composite"
-        layer.sourceLayer = "housenum_label"
-        layer.minZoom = 16.5
-        layer.textField = .expression(Exp(.get) { "house_num" })
-        layer.textSize = .constant(15)
-        layer.textColor = .constant(StyleColor(_nightMode ? .white : HostMapColor.ink))
-        layer.textHaloColor = .constant(StyleColor(_nightMode ? HostMapColor.ink : .white))
-        layer.textHaloWidth = .constant(1.5)
-        layer.textFont = .constant(["DIN Pro Medium", "Arial Unicode MS Regular"])
-        try? style.addLayer(layer)
+        guard style.sourceExists(withId: "composite") else { return }
+        let own = (_doorView?.label ?? "").trimmingCharacters(in: .whitespaces)
+        let stop = _doorView?.coordinate
+        let key = "\(_nightMode)|\(own)|\(stop.map { "\($0.latitude),\($0.longitude)" } ?? "")"
+        if style.layerExists(withId: layerId), key != _houseNumbersKey {
+            try? style.removeLayer(withId: layerId)
+        }
+        if !style.layerExists(withId: layerId) {
+            var layer = SymbolLayer(id: layerId)
+            layer.source = "composite"
+            layer.sourceLayer = "housenum_label"
+            layer.minZoom = 16
+            layer.textField = .expression(Exp(.get) { "house_num" })
+            if !own.isEmpty, let stop = stop {
+                layer.filter = Self.notTheStopsNumber(own, at: stop)
+            }
+            layer.textSize = .expression(Exp(.interpolate) {
+                Exp(.linear)
+                Exp(.zoom)
+                16.5; 12
+                18; 16
+            })
+            layer.textPadding = .constant(1)
+            layer.textColor = .constant(StyleColor(_nightMode ? .white : HostMapColor.ink))
+            layer.textHaloColor = .constant(StyleColor(_nightMode ? HostMapColor.tip : .white))
+            layer.textHaloWidth = .constant(2)
+            layer.textFont = .constant(["DIN Pro Bold", "Arial Unicode MS Bold"])
+            guard (try? style.addLayer(layer)) != nil else { return }
+            _houseNumbersKey = key
+        }
+        // Above the lit building, whenever that arrives.
+        let ids = style.allLayerIdentifiers.map { $0.id }
+        if let lit = ids.firstIndex(where: { $0.hasSuffix("_buildingExtrusionLayer") }),
+           let numbers = ids.firstIndex(of: layerId), numbers < lit {
+            try? style.moveLayer(withId: layerId, to: .above(ids[lit]))
+        }
     }
 }

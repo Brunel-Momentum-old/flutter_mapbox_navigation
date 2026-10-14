@@ -28,6 +28,11 @@ import com.mapbox.maps.MapView
 import com.mapbox.maps.Style
 import com.mapbox.maps.plugin.delegates.listeners.OnStyleLoadedListener
 import com.mapbox.maps.extension.style.expressions.dsl.generated.get
+import com.mapbox.maps.extension.style.expressions.dsl.generated.interpolate
+import com.mapbox.maps.extension.style.expressions.generated.Expression
+import org.json.JSONArray
+import org.json.JSONObject
+import com.mapbox.maps.LayerPosition
 import com.mapbox.maps.extension.style.layers.addLayer
 import com.mapbox.maps.extension.style.layers.addLayerBelow
 import com.mapbox.maps.extension.style.layers.generated.lineLayer
@@ -92,28 +97,27 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val TRAFFIC_MODERATE = Color.parseColor("#F0A91B")
         val TRAFFIC_HEAVY = Color.parseColor("#C8402F")
         val TRAFFIC_SEVERE = Color.parseColor("#9E3325")
-        val TRAVELLED = Color.parseColor("#B9B6AE")
+
+        // The part of the route already driven: the route's own blue,
+        // faded towards the map it lies on. Pale on the day map, dim on
+        // the night one. iOS uses the same.
+        val TRAVELLED_DAY = Color.parseColor("#A9BFEC")
+        val TRAVELLED_NIGHT = Color.parseColor("#2E3F66")
+
+        // The edge of the route line. White lifts it off the day map; on
+        // the night map a white edge glared, so it is a deeper blue there.
+        val CASING_DAY = Color.WHITE
+        val CASING_NIGHT = Color.parseColor("#122F78")
         val GREEN = Color.parseColor("#2B7348")
         val BUILDING_FILL = Color.parseColor("#BFDCCB")
         val INK = Color.parseColor("#2B2B2B")
         val LEFT_ROUTE = Color.parseColor("#8E8B83")
-        /** As close as the following camera comes at a turn; iOS uses the same. */
-        private const val CLOSEST_FOLLOWING_ZOOM = 18.75
+        // The layer the SDK lights the stop's building with.
+        private const val BUILDING_HIGHLIGHT_LAYER = "mapbox-building-highlight-layer"
 
-        // What the SDK ships its following camera with (the defaults of
-        // `FollowingFrameOptions`, the same on iOS): the least zoom it
-        // may use, and the closest it comes when left alone.
-        private const val SDK_LEAST_FOLLOWING_ZOOM = 10.5
-        private const val SDK_CLOSEST_FOLLOWING_ZOOM = 16.35
-
-        // The camera starts to close in on a turn this far out, and is
-        // fully in by the second distance. On a fast road the turn
-        // arrives sooner, so each is at least that many seconds of
-        // driving.
-        private const val CLOSE_IN_FROM_M = 200.0
-        private const val CLOSE_IN_FROM_S = 12.0
-        private const val CLOSE_IN_BY_M = 60.0
-        private const val CLOSE_IN_BY_S = 4.0
+        // A house number this close to the stop and the same as its own is
+        // the stop's: the host draws that one itself. iOS uses the same.
+        private const val OWN_NUMBER_M = 30.0
 
         /**
          * Frames a second while the driver is moving, or something on
@@ -217,9 +221,24 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     /** Dark map in use: labels this class adds switch to light on dark. */
     var night = false
         set(value) {
-            if (value != field) wakeMap()
+            if (value == field) return
+            wakeMap()
             field = value
+            // The route line takes the colours of the map it lies on,
+            // and the house numbers their ink.
+            if (routeLineResources != null) {
+                routeLineResources = routeLineResources()
+                navigationView.customizeViewOptions { routeLineOptions = routeLineOptions() }
+            }
+            mapView?.getMapboxMap()?.getStyle { applyFasterRoute(it) }
         }
+
+    /**
+     * What the following camera keeps clear, in pixels: the host's
+     * padding and the room Drop-In's camera is given on top of it. The
+     * driver's marker sits at the bottom edge of it.
+     */
+    var cameraPadding: EdgeInsets? = null
 
     private var routeLineAnchor = "road-label-simple"
     private val styleLoaded = OnStyleLoadedListener {
@@ -233,25 +252,10 @@ class MapLook(private val context: Context, private val navigationView: Navigati
 
     /** Route line colours and the puck. Call before guidance starts. */
     fun applyStyle() {
-        val colors = RouteLineColorResources.Builder()
-            .routeDefaultColor(ROUTE)
-            .routeUnknownCongestionColor(ROUTE)
-            .routeLowCongestionColor(ROUTE)
-            .routeModerateCongestionColor(TRAFFIC_MODERATE)
-            .routeHeavyCongestionColor(TRAFFIC_HEAVY)
-            .routeSevereCongestionColor(TRAFFIC_SEVERE)
-            .routeCasingColor(Color.WHITE)
-            .routeLineTraveledColor(TRAVELLED)
-            .routeLineTraveledCasingColor(Color.WHITE)
-            .build()
         val puck = LocationPuck2D(
             bearingImage = BitmapDrawable(context.resources, puckBitmap())
         )
-        routeLineResources = RouteLineResources.Builder()
-            .routeLineColorResources(colors)
-            .originWaypointIcon(R.drawable.host_no_waypoint)
-            .destinationWaypointIcon(R.drawable.host_no_waypoint)
-            .build()
+        routeLineResources = routeLineResources()
         navigationView.customizeViewOptions {
             routeLineOptions = routeLineOptions()
             enableBuildingHighlightOnArrival = false
@@ -268,6 +272,28 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     }
 
     private var routeLineResources: RouteLineResources? = null
+
+    /** The route line's colours, for the day map or the night one. */
+    private fun routeLineResources(): RouteLineResources {
+        val travelled = if (night) TRAVELLED_NIGHT else TRAVELLED_DAY
+        val colors = RouteLineColorResources.Builder()
+            .routeDefaultColor(ROUTE)
+            .routeUnknownCongestionColor(ROUTE)
+            .routeLowCongestionColor(ROUTE)
+            .routeModerateCongestionColor(TRAFFIC_MODERATE)
+            .routeHeavyCongestionColor(TRAFFIC_HEAVY)
+            .routeSevereCongestionColor(TRAFFIC_SEVERE)
+            .routeCasingColor(if (night) CASING_NIGHT else CASING_DAY)
+            .routeLineTraveledColor(travelled)
+            // One faded line with no edge of its own, as on iOS.
+            .routeLineTraveledCasingColor(travelled)
+            .build()
+        return RouteLineResources.Builder()
+            .routeLineColorResources(colors)
+            .originWaypointIcon(R.drawable.host_no_waypoint)
+            .destinationWaypointIcon(R.drawable.host_no_waypoint)
+            .build()
+    }
 
     private fun routeLineOptions(): MapboxRouteLineOptions {
         val builder = MapboxRouteLineOptions.Builder(context)
@@ -290,6 +316,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             navigationView.customizeViewOptions { routeLineOptions = routeLineOptions() }
         }
         // A new style drops the layers this class added.
+        houseNumbersKey = null
         if (doorEnabled) addHouseNumbers()
         if (routeLook != "normal") applyRouteLook(style)
         applyTrafficLights(style)
@@ -312,6 +339,12 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         followCameraTuned = false
         followViewport = null
         followCamera = null
+        turnView = TurnView.State()
+        turnPitch = null
+        turnZoom = null
+        turnZoomTarget = null
+        turnViewAtMs = 0L
+        houseNumbersKey = null
         watchTouches(view)
         // Whatever rate this map was made with, it starts at the moving
         // one, and what the last map was set to says nothing about it.
@@ -588,7 +621,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         style.addSource(geoJsonSource(FASTER_ROUTE_ID) { geometry(branch) })
         val anchor = ROUTE_LINE_ANCHORS.firstOrNull { style.styleLayerExists(it) }
         val casing = lineLayer(FASTER_ROUTE_CASING_ID, FASTER_ROUTE_ID) {
-            lineColor(Color.WHITE)
+            lineColor(if (night) TIP_GREEN else Color.WHITE)
             lineWidth(12.0)
             lineCap(LineCap.ROUND)
         }
@@ -710,8 +743,10 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             highlightAttempts = 0
         }
         doorPoint = point
+        // Every time: the number left out of the map's own is the stop's.
+        addHouseNumbers()
         if (entering) {
-            addHouseNumbers()
+            dropTurnView()
             refreshPins()
             refreshTags()
         }
@@ -762,14 +797,14 @@ class MapLook(private val context: Context, private val navigationView: Navigati
                 .firstOrNull() ?: return
             viewport.options.followingFrameOptions.bearingSmoothing.enabled = false
             viewport.options.followingFrameOptions.pitchNearManeuvers.enabled = false
-            // The camera closes in as a turn comes up, but the SDK stops
-            // it where the screen still shows 600 m; 30 m from a junction
-            // the lanes and the turn were a few pixels across.
-            viewport.options.followingFrameOptions.maxZoom = CLOSEST_FOLLOWING_ZOOM
+            // Looking straight down, the SDK stops following the driver
+            // and frames the road ahead instead. The bird's-eye view at
+            // a turn keeps the marker where it is ([frameTurn]).
+            viewport.options.followingFrameOptions.maximizeViewableGeometryWhenPitchZero = false
             viewport.evaluate()
             followCameraTuned = true
-            // Kept, so that closing in on a turn and pacing the map do
-            // not have to go looking for them again on every tick.
+            // Kept, so that the view at a turn and pacing the map do not
+            // have to go looking for them again on every tick.
             followViewport = viewport
             followCamera = camera as? NavigationCamera
         } catch (e: Exception) {
@@ -778,59 +813,166 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }
     }
 
-    // ---- closing in on a turn -----------------------------------------
+    // ---- bird's-eye view at a turn ------------------------------------
 
-    // Where the following camera takes its zoom limits from: found once
-    // by [tuneFollowCamera], for the map now attached.
+    // Where the following camera takes its tilt and zoom from: found
+    // once by [tuneFollowCamera], for the map now attached.
     private var followViewport: MapboxNavigationViewportDataSource? = null
-    private var closeInFailed = false
+    private var turnViewFailed = false
+    private var turnView = TurnView.State()
+
+    // The tilt and zoom the following camera is being held at, while
+    // this class has them. Null while the SDK has its camera.
+    private var turnPitch: Double? = null
+    private var turnZoom: Double? = null
+    private var turnZoomTarget: Double? = null
+    private var turnViewAtMs = 0L
 
     /**
-     * Holds the following camera close as a turn comes up. Runs on every
-     * progress tick. [distanceToTurn] is in metres, and null when what
-     * comes next is not a turn: arriving is not one, the door view frames
-     * that. [speed] is the driver's, in metres a second.
+     * Takes the following camera straight down as a turn comes up, and
+     * back to its tilt once past it. Runs on every progress tick. When
+     * and how close is decided in [TurnView]; this moves the camera.
      *
-     * The SDK works the zoom out from how much road is left before the
-     * turn, and it does come in, but not reliably: a short street, or a
-     * run of junctions, and it was still showing several blocks with the
-     * turn 30 m away. So the least zoom it may use is raised as the turn
-     * nears, from the SDK's own closest at 200 m to nearly the closest
-     * allowed ([CLOSEST_FOLLOWING_ZOOM]) inside 60 m. On a fast road the
-     * turn arrives sooner, so both distances are at least a few seconds
-     * of driving: at 100 km/h it starts 330 m out and is fully in by
-     * 110 m. With no turn near it goes back to what the SDK ships.
+     * [needsChoice] is whether the step being driven ends in a turn the
+     * driver has to pick a way at, with a route that can be trusted.
+     * [distanceToTurn] and [distanceIntoStep] are in metres, [speed] in
+     * metres a second. [ahead] is the road from the driver to the turn
+     * and the first stretch after it.
+     *
+     * The SDK's following camera goes on placing the driver and turning
+     * the map: only its tilt and its zoom are overridden, and only from
+     * the moment the view starts to come up until it is fully back. The
+     * SDK moves the camera to whatever it is given over the second
+     * between two ticks, so a target that changes a little each tick is
+     * a smooth move on screen.
+     *
+     * This replaces the earlier "close in on a turn", which raised the
+     * tilted camera's least zoom as a turn neared: two rules moving one
+     * zoom fought each other.
      */
-    fun closeInOnTurn(distanceToTurn: Double?, speed: Double) {
+    fun frameTurn(
+        stepKey: Int,
+        needsChoice: Boolean,
+        distanceToTurn: Double?,
+        distanceIntoStep: Double,
+        speed: Double,
+        location: Location?,
+        ahead: List<Point>,
+    ) {
         val viewport = followViewport ?: return
-        if (closeInFailed) return
+        val view = mapView ?: return
+        if (turnViewFailed) return
         try {
-            val near = CLOSEST_FOLLOWING_ZOOM - 0.25
-            var least = SDK_LEAST_FOLLOWING_ZOOM
-            if (distanceToTurn != null && distanceToTurn.isFinite()) {
-                val pace = if (speed.isFinite()) max(0.0, speed) else 0.0
-                val from = max(CLOSE_IN_FROM_M, pace * CLOSE_IN_FROM_S)
-                val by = max(CLOSE_IN_BY_M, pace * CLOSE_IN_BY_S)
-                if (distanceToTurn <= by) {
-                    least = near
-                } else if (distanceToTurn <= from) {
-                    least = SDK_CLOSEST_FOLLOWING_ZOOM +
-                        (from - distanceToTurn) / (from - by) * (near - SDK_CLOSEST_FOLLOWING_ZOOM)
+            val now = SystemClock.elapsedRealtime()
+            val elapsed = if (turnViewAtMs == 0L) 1.0 else ((now - turnViewAtMs) / 1000.0).coerceIn(0.2, 1.5)
+            turnViewAtMs = now
+
+            // The door view has the camera to itself.
+            val choice = needsChoice && !doorEnabled
+            val wasTopDown = turnView.topDown
+            turnView = TurnView.next(
+                turnView, stepKey, choice, distanceToTurn,
+                if (doorEnabled) Double.POSITIVE_INFINITY else distanceIntoStep, speed,
+            )
+            if (turnView.topDown != wasTopDown) wakeMap()
+
+            val tilt = viewport.options.followingFrameOptions.defaultPitch
+            // The SDK has the camera and nothing is asked of it.
+            if (!turnView.topDown && turnPitch == null) return
+
+            val camera = view.getMapboxMap().cameraState
+            var pitch = turnPitch ?: camera.pitch
+            var zoom = turnZoom ?: camera.zoom
+            val zoomTarget: Double
+            if (turnView.topDown) {
+                // While the turn is ahead the zoom follows it in.
+                // Through the turn and just past it, it stays where it
+                // was: what is ahead then is the whole of the next street.
+                if (choice && turnView.stepKey == stepKey && location != null) {
+                    turnZoom(location, ahead, view)?.let { turnZoomTarget = it }
                 }
+                zoomTarget = turnZoomTarget ?: zoom
+            } else {
+                // Back to where the SDK's own zoom takes over without a jump.
+                zoomTarget = min(zoom, TurnView.TILTED_CLOSEST_ZOOM)
             }
-            val options = viewport.options.followingFrameOptions
-            // Only a change worth seeing is written: every write has the
-            // camera work its frame out again.
-            if (abs(options.minZoom - least) <= 0.05 && options.maxZoom == CLOSEST_FOLLOWING_ZOOM) return
-            options.minZoom = least
-            options.maxZoom = CLOSEST_FOLLOWING_ZOOM
-            // The SDK reads the limits when it works the frame out, not
-            // when they are set, so it is asked to do that now and not
-            // at its next fix.
+            val pitchTarget = if (turnView.topDown) 0.0 else tilt
+            if (followCamera?.state == NavigationCameraState.FOLLOWING) {
+                pitch = TurnView.step(pitch, pitchTarget, tilt / TurnView.EASE_SECONDS * elapsed)
+                zoom = TurnView.step(zoom, zoomTarget, TurnView.ZOOM_PER_SECOND * elapsed)
+            } else {
+                // Nobody is watching the following camera (the overview,
+                // a map the driver has moved, the door view): it is
+                // simply where it should be when they come back to it.
+                pitch = pitchTarget
+                zoom = zoomTarget
+            }
+
+            if (!turnView.topDown && pitch == pitchTarget && zoom == zoomTarget) {
+                // Fully back: the SDK has its camera again.
+                dropTurnView()
+                return
+            }
+            turnPitch = pitch
+            turnZoom = zoom
+            viewport.followingPitchPropertyOverride(pitch)
+            viewport.followingZoomPropertyOverride(zoom)
+            // The SDK reads these when it works the frame out, not when
+            // they are set, so it is asked to do that now and not at its
+            // next fix.
             viewport.evaluate()
         } catch (e: Exception) {
-            closeInFailed = true
-            Log.w("MapLook", "camera not held close at turns: $e")
+            turnViewFailed = true
+            Log.w("MapLook", "no bird's-eye view at turns: $e")
+            try {
+                dropTurnView()
+            } catch (_: Exception) {
+                // The camera keeps what it has.
+            }
+        }
+    }
+
+    /**
+     * The bird's-eye zoom that has the driver, the turn and the first
+     * stretch after it between the host's banner and its sheet.
+     */
+    private fun turnZoom(location: Location, ahead: List<Point>, view: MapView): Double? {
+        if (ahead.isEmpty()) return null
+        val heading = (if (location.hasBearing()) location.bearing.toDouble() else view.getMapboxMap().cameraState.bearing) *
+            PI / 180
+        val northMetres = 111_320.0
+        val eastMetres = northMetres * cos(location.latitude * PI / 180)
+        val points = ahead.map {
+            val north = (it.latitude() - location.latitude) * northMetres
+            val east = (it.longitude() - location.longitude) * eastMetres
+            TurnView.Offset(
+                ahead = east * sin(heading) + north * cos(heading),
+                side = east * cos(heading) - north * sin(heading),
+            )
+        }
+        val padding = cameraPadding ?: hostPadding ?: EdgeInsets(0.0, 0.0, 0.0, 0.0)
+        val aheadDp = (view.height - padding.top - padding.bottom) / density
+        val halfWidthDp = (view.width - padding.left - padding.right) / density / 2
+        return TurnView.fitZoom(points, max(120.0, aheadDp), halfWidthDp, location.latitude)
+    }
+
+    /**
+     * Hands the camera back to the SDK at once: for a trip starting or
+     * ending, and when the view has eased all the way back.
+     */
+    fun dropTurnView() {
+        turnView = TurnView.State()
+        turnPitch = null
+        turnZoom = null
+        turnZoomTarget = null
+        turnViewAtMs = 0L
+        val viewport = followViewport ?: return
+        try {
+            viewport.followingPitchPropertyOverride(null)
+            viewport.followingZoomPropertyOverride(null)
+            viewport.evaluate()
+        } catch (e: Exception) {
+            Log.w("MapLook", "camera not handed back after a turn: $e")
         }
     }
 
@@ -1074,13 +1216,21 @@ class MapLook(private val context: Context, private val navigationView: Navigati
                 if (!doorEnabled) return@queryBuildingToHighlight
                 if (buildings.isNotEmpty()) {
                     footprintFound = true
-                    view.getMapboxMap().getStyle { buildingView.highlightBuilding(it, buildings, highlightOptions) }
+                    view.getMapboxMap().getStyle {
+                        buildingView.highlightBuilding(it, buildings, highlightOptions)
+                        // The lit building goes on top of everything
+                        // there is, the house numbers included.
+                        raiseHouseNumbers(it)
+                    }
                 }
                 // No footprint under the pin once it has had time to
                 // come on screen: mark the spot instead of the building.
                 // Once the building itself is lit up, nothing is drawn
                 // over it: a number tag on top hid the very house the
-                // driver is looking for.
+                // driver is looking for. The number itself is always
+                // there, though: as a small badge on the building once
+                // it is lit, since the map's own number for it cannot be
+                // counted on (see [addHouseNumbers]).
                 showDoorMarker(destination, ring = buildings.isEmpty() && attempt >= 4, tag = buildings.isEmpty())
             }
         }
@@ -1092,6 +1242,8 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             doorPolygonManager = it
         }
         val points = doorPointManager ?: view.annotations.createPointAnnotationManager().also {
+            // The stop's own number: no other label may push it off.
+            it.iconAllowOverlap = true
             doorPointManager = it
         }
         polygons.deleteAll()
@@ -1105,13 +1257,19 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             )
         }
         points.deleteAll()
-        if (!tag) return
-        points.create(
-            PointAnnotationOptions()
-                .withPoint(point)
-                .withIconImage(doorBitmap(doorLabel?.trim().orEmpty()))
-                .withIconAnchor(IconAnchor.BOTTOM)
-        )
+        val label = doorLabel?.trim().orEmpty()
+        if (tag) {
+            points.create(
+                PointAnnotationOptions()
+                    .withPoint(point)
+                    .withIconImage(doorBitmap(label))
+                    .withIconAnchor(IconAnchor.BOTTOM)
+            )
+        } else if (label.isNotEmpty()) {
+            // The building is lit: its number sits on it, small enough
+            // to leave the building in view.
+            points.create(PointAnnotationOptions().withPoint(point).withIconImage(doorBadgeBitmap(label)))
+        }
     }
 
     private fun circle(center: Point, radius: Double): List<Point> {
@@ -1127,24 +1285,100 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }
     }
 
-    /** House numbers from the street data the base style already carries. */
+    // What the house-number layer on the map was built for.
+    private var houseNumbersKey: String? = null
+
+    /**
+     * House numbers on every building, from the street data the base
+     * style already carries but does not draw.
+     *
+     * Three things used to lose numbers:
+     *
+     * - The lit building is a layer the SDK adds on top of everything
+     *   when it finds the building, after this layer: the stop's own
+     *   number was under its fill. This layer is kept above it
+     *   ([raiseHouseNumbers]).
+     * - Numbers that touch are dropped by the map, and at the zoom the
+     *   door view starts at, with 15-point text, the houses of a terrace
+     *   were close enough for every other one to go. The text is smaller
+     *   further out and has less room kept round it.
+     * - Not every building has a number in the map's data at all.
+     *
+     * The last cannot be fixed from here, so the stop's own number does
+     * not rely on this layer: it is drawn by [showDoorMarker], and the
+     * map's number for the same house is left out so it is not there
+     * twice.
+     */
     private fun addHouseNumbers() {
         mapView?.getMapboxMap()?.getStyle { style ->
-            if (style.styleLayerExists(HOUSE_NUMBER_LAYER) || !style.styleSourceExists("composite")) {
-                return@getStyle
+            if (!style.styleSourceExists("composite")) return@getStyle
+            val own = doorLabel?.trim().orEmpty()
+            val stop = doorPoint
+            val key = "$night|$own|${stop?.latitude()},${stop?.longitude()}"
+            if (style.styleLayerExists(HOUSE_NUMBER_LAYER)) {
+                if (key == houseNumbersKey) {
+                    raiseHouseNumbers(style)
+                    return@getStyle
+                }
+                style.removeStyleLayer(HOUSE_NUMBER_LAYER)
             }
             style.addLayer(
                 symbolLayer(HOUSE_NUMBER_LAYER, "composite") {
                     sourceLayer("housenum_label")
-                    minZoom(16.5)
+                    minZoom(16.0)
                     textField(get { literal("house_num") })
-                    textSize(15.0)
+                    if (own.isNotEmpty() && stop != null) filter(notTheStopsNumber(own, stop))
+                    textSize(
+                        interpolate {
+                            linear()
+                            zoom()
+                            stop { literal(16.5); literal(12.0) }
+                            stop { literal(18.0); literal(16.0) }
+                        }
+                    )
+                    textPadding(1.0)
+                    textFont(listOf("DIN Pro Bold", "Arial Unicode MS Bold"))
                     textColor(if (night) Color.WHITE else INK)
-                    textHaloColor(if (night) INK else Color.WHITE)
-                    textHaloWidth(1.5)
+                    textHaloColor(if (night) TIP else Color.WHITE)
+                    textHaloWidth(2.0)
                 }
             )
+            houseNumbersKey = key
+            raiseHouseNumbers(style)
         }
+    }
+
+    /**
+     * Every house number but the stop's own: the same number within
+     * [OWN_NUMBER_M] of the stop. Further off it is another house's (or
+     * the stop's pin is not on its house), and stays.
+     */
+    private fun notTheStopsNumber(number: String, stop: Point): Expression {
+        val dLat = OWN_NUMBER_M / 111_320.0
+        val dLng = OWN_NUMBER_M / (111_320.0 * cos(stop.latitude() * PI / 180))
+        val s = stop.latitude() - dLat
+        val n = stop.latitude() + dLat
+        val w = stop.longitude() - dLng
+        val e = stop.longitude() + dLng
+        val ring = JSONArray(listOf(listOf(w, s), listOf(e, s), listOf(e, n), listOf(w, n), listOf(w, s)).map { JSONArray(it) })
+        val polygon = JSONObject().put("type", "Polygon").put("coordinates", JSONArray().put(ring))
+        val filter = JSONArray()
+            .put("!")
+            .put(
+                JSONArray().put("all")
+                    .put(JSONArray().put("==").put(JSONArray().put("to-string").put(JSONArray().put("get").put("house_num"))).put(number))
+                    .put(JSONArray().put("within").put(polygon))
+            )
+        return Expression.fromRaw(filter.toString())
+    }
+
+    /** Puts the house numbers above the lit building, if it is above them. */
+    private fun raiseHouseNumbers(style: Style) {
+        val ids = style.styleLayers.map { it.id }
+        val lit = ids.indexOf(BUILDING_HIGHLIGHT_LAYER)
+        val numbers = ids.indexOf(HOUSE_NUMBER_LAYER)
+        if (lit < 0 || numbers < 0 || numbers > lit) return
+        style.moveStyleLayer(HOUSE_NUMBER_LAYER, LayerPosition(BUILDING_HIGHLIGHT_LAYER, null, null))
     }
 
     // ---- bitmaps ------------------------------------------------------
@@ -1291,6 +1525,31 @@ class MapLook(private val context: Context, private val navigationView: Navigati
             paint.color = Color.parseColor(lamp)
             canvas.drawCircle(rect.centerX(), rect.top + dp(9f) + index * dp(10f), dp(3.8f), paint)
         }
+        return bitmap
+    }
+
+    /**
+     * The stop's house number on the lit building: a small green pill
+     * with a white edge, the same on the day and the night map.
+     */
+    private fun doorBadgeBitmap(label: String): Bitmap {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textSize = dp(16f)
+        paint.textAlign = Paint.Align.CENTER
+        val width = max(dp(34f), paint.measureText(label) + dp(16f))
+        val height = dp(26f)
+        val bitmap = Bitmap.createBitmap((width + dp(6f)).toInt(), (height + dp(6f)).toInt(), Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val rect = RectF(dp(3f), dp(3f), dp(3f) + width, dp(3f) + height)
+        paint.color = GREEN
+        canvas.drawRoundRect(rect, height / 2, height / 2, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(2f)
+        paint.color = Color.WHITE
+        canvas.drawRoundRect(rect, height / 2, height / 2, paint)
+        paint.style = Paint.Style.FILL
+        canvas.drawText(label, rect.centerX(), rect.centerY() - (paint.descent() + paint.ascent()) / 2, paint)
         return bitmap
     }
 
