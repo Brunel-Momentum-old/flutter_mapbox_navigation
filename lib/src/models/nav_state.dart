@@ -317,7 +317,7 @@ class RouteSwitched {
 
   /// Accepts the event payload as a map (Android) or a JSON string (iOS).
   static RouteSwitched? tryParse(Object? data) {
-    Object? decoded = data;
+    var decoded = data;
     if (decoded is String) {
       if (decoded.isEmpty) return null;
       try {
