@@ -51,7 +51,14 @@ class MapBoxNavigationView extends StatelessWidget {
         surfaceFactory: (context, controller) {
           return AndroidViewSurface(
             controller: controller as AndroidViewController,
-            gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{},
+            // The map takes every touch that lands on it. With none here a
+            // tap never reached it — a drag did, a tap was lost in Flutter's
+            // gesture arena — so a tap on another way's tag or line did
+            // nothing (2026-10-19). Flutter widgets drawn over the map are
+            // hit first and keep their own taps.
+            gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{
+              Factory<OneSequenceGestureRecognizer>(EagerGestureRecognizer.new),
+            },
             hitTestBehavior: PlatformViewHitTestBehavior.opaque,
           );
         },

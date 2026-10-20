@@ -2,7 +2,10 @@ package com.eopeter.fluttermapboxnavigation.models.views
 
 import android.app.Activity
 import android.content.Context
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import com.eopeter.fluttermapboxnavigation.MapLook
@@ -13,6 +16,7 @@ import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.mapbox.geojson.Point
 import com.mapbox.maps.MapInitOptions
 import com.mapbox.maps.MapView
+import com.mapbox.maps.ScreenCoordinate
 import com.mapbox.maps.plugin.compass.compass
 import com.mapbox.maps.plugin.gestures.OnMapClickListener
 import com.mapbox.maps.plugin.gestures.gestures
@@ -142,20 +146,46 @@ class EmbeddedNavigationMapView(
                         // A driver may take another way by tapping it
                         // (founder, 2026-10-19): its tag, or its line
                         // within a fingertip (`takeAlternativeAt`).
-                        // Drop-In would take a tapped alternative on its
-                        // own, from further away, so while there is more
-                        // than one route the tap is ours. This listener
-                        // is registered before Drop-In's, and the first
-                        // to return true ends the walk.
+                        //
+                        // The tap is read from the touches themselves, not
+                        // from the map's click: inside the Flutter view
+                        // the map gets a tap's touches but never calls its
+                        // click listeners (seen on the emulator). The
+                        // listener stays, and stays first, so Drop-In does
+                        // not take a tapped alternative on its own, from
+                        // further away, should clicks work on a phone.
                         val map = this
-                        gestures.addOnMapClickListener { point ->
-                            if ((MapboxNavigationApp.current()?.getNavigationRoutes()?.size ?: 0) > 1) {
-                                takeAlternativeAt(map, point)
-                                true
-                            } else {
-                                false
+                        val slop = ViewConfiguration.get(ctx).scaledTouchSlop
+                        var downX = 0f
+                        var downY = 0f
+                        var downAt = 0L
+                        var tapping = false
+                        setOnTouchListener { _, e ->
+                            when (e.actionMasked) {
+                                MotionEvent.ACTION_DOWN -> {
+                                    downX = e.x
+                                    downY = e.y
+                                    downAt = SystemClock.uptimeMillis()
+                                    tapping = true
+                                }
+                                MotionEvent.ACTION_MOVE ->
+                                    if (Math.abs(e.x - downX) > slop || Math.abs(e.y - downY) > slop) tapping = false
+                                MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> tapping = false
+                                MotionEvent.ACTION_UP -> {
+                                    val quick = SystemClock.uptimeMillis() - downAt < ViewConfiguration.getLongPressTimeout()
+                                    if (tapping && quick && moreThanOneRoute()) {
+                                        val at = getMapboxMap().coordinateForPixel(
+                                            ScreenCoordinate(e.x.toDouble(), e.y.toDouble())
+                                        )
+                                        takeAlternativeAt(map, at)
+                                    }
+                                    tapping = false
+                                }
                             }
+                            // The map still pans, zooms and tilts.
+                            false
                         }
+                        gestures.addOnMapClickListener { moreThanOneRoute() }
                     }
                 }
             }
@@ -230,6 +260,9 @@ class EmbeddedNavigationMapView(
         methodChannel?.setMethodCallHandler(null)
         releaseEventChannel()
     }
+
+    private fun moreThanOneRoute() =
+        (MapboxNavigationApp.current()?.getNavigationRoutes()?.size ?: 0) > 1
 
     private val onMapClick = object : MapViewObserver(), OnMapClickListener {
         override fun onAttached(mapView: MapView) {
