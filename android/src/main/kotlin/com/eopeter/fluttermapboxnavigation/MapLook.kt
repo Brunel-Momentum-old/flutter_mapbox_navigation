@@ -400,6 +400,7 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         shownTurnTag = ""
         shownTrafficTag = ""
         shownFasterTips = ""
+        shownAlternativeTips = ""
         destinationPinManager = null
         shownDestinationPin = ""
         // A new map has a camera of its own, to be found and tuned again.
@@ -541,6 +542,20 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val layer = symbolLayer(TRAFFIC_LIGHT_ID, TRAFFIC_LIGHT_ID) {
             iconImage(TRAFFIC_LIGHT_ID)
             iconAllowOverlap(true)
+            // Taking no room from the street names, and smaller the
+            // further out the camera is: the two lights of one crossing,
+            // some 20 m apart, sit side by side at the driving view
+            // instead of on top of each other (founder, 2026-10-19).
+            iconIgnorePlacement(true)
+            iconSize(
+                interpolate {
+                    linear()
+                    zoom()
+                    stop { literal(15.5); literal(0.62) }
+                    stop { literal(17.5); literal(0.85) }
+                    stop { literal(19.0); literal(1.0) }
+                }
+            )
             // Only close enough to matter: a route's worth of lights
             // at city zoom is confetti.
             minZoom(15.5)
@@ -559,6 +574,9 @@ class MapLook(private val context: Context, private val navigationView: Navigati
     private var fasterRoute: LineString? = null
     private var fasterTips: List<Pair<Point, String>> = emptyList()
     private var shownFasterTips = ""
+    /** Every other way, tagged with what it costs or saves. */
+    private var alternativeTips: List<Pair<Point, String>> = emptyList()
+    private var shownAlternativeTips = ""
 
     /** The street the next turn goes onto, tagged at the turn. Null for none. */
     fun setTurnTag(point: Point?, street: String?) {
@@ -708,6 +726,18 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         }
     }
 
+    /**
+     * Every other way the route could go, each tagged with what it costs
+     * or saves against the route in use ("+3 min", "2 min faster", "Same
+     * time"), in the look of the street tag at a turn (founder,
+     * 2026-10-19). A tap on a tag, or on the line, takes that way
+     * (`TurnByTurn.takeAlternativeAt`).
+     */
+    fun setAlternativeTags(tips: List<Pair<Point, String>>) {
+        alternativeTips = tips
+        refreshTags()
+    }
+
     /** One manager for both kinds of tag, so they stack predictably. */
     private fun refreshTags() {
         val view = mapView ?: return
@@ -721,10 +751,18 @@ class MapLook(private val context: Context, private val navigationView: Navigati
         val traffic = trafficTag?.takeIf { !doorEnabled && fasterRoute == null }
         val trafficKey = traffic?.let { "${it.first.latitude()},${it.first.longitude()},${it.second}" }.orEmpty()
         val tipsKey = fasterTips.joinToString(";") { "${it.first.latitude()},${it.first.longitude()},${it.second}" }
-        if (turnKey == shownTurnTag && trafficKey == shownTrafficTag && tipsKey == shownFasterTips) return
+        // The other ways' tags are for the road, not the door.
+        val alternatives = if (doorEnabled) emptyList() else alternativeTips
+        val alternativesKey = alternatives.joinToString(";") {
+            "${it.first.latitude()},${it.first.longitude()},${it.second}"
+        }
+        if (turnKey == shownTurnTag && trafficKey == shownTrafficTag && tipsKey == shownFasterTips &&
+            alternativesKey == shownAlternativeTips
+        ) return
         shownTurnTag = turnKey
         shownTrafficTag = trafficKey
         shownFasterTips = tipsKey
+        shownAlternativeTips = alternativesKey
         val manager = tagManager ?: view.annotations.createPointAnnotationManager().also { tagManager = it }
         manager.deleteAll()
         if (turn != null) {
@@ -748,6 +786,13 @@ class MapLook(private val context: Context, private val navigationView: Navigati
                 PointAnnotationOptions().withPoint(point)
                     .withIconImage(tagBitmap(text, if (text == "Yours") TIP else TIP_GREEN, pointer = false))
                     .withSymbolSortKey(if (text == "Yours") 0.0 else 1.0)
+            )
+        }
+        for ((point, text) in alternatives) {
+            manager.create(
+                PointAnnotationOptions().withPoint(point)
+                    .withIconImage(tagBitmap(text, TIP, pointer = false))
+                    .withSymbolSortKey(2.0)
             )
         }
     }

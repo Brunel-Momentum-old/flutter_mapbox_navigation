@@ -139,15 +139,22 @@ class EmbeddedNavigationMapView(
                         // battery pays for it. From here on MapLook sets
                         // the rate: this one moving, a lower one stopped.
                         setMaximumFps(MapLook.MOVING_FPS)
-                        // Drop-In makes a tapped alternative the route in
-                        // use, with no question asked. The host offers a
-                        // faster route in its own card and nothing may
-                        // switch without it, so while there is more than
-                        // one route a tap on the map stops here. This
-                        // listener is registered before Drop-In's, and
-                        // the first to return true ends the walk.
-                        gestures.addOnMapClickListener {
-                            (MapboxNavigationApp.current()?.getNavigationRoutes()?.size ?: 0) > 1
+                        // A driver may take another way by tapping it
+                        // (founder, 2026-10-19): its tag, or its line
+                        // within a fingertip (`takeAlternativeAt`).
+                        // Drop-In would take a tapped alternative on its
+                        // own, from further away, so while there is more
+                        // than one route the tap is ours. This listener
+                        // is registered before Drop-In's, and the first
+                        // to return true ends the walk.
+                        val map = this
+                        gestures.addOnMapClickListener { point ->
+                            if ((MapboxNavigationApp.current()?.getNavigationRoutes()?.size ?: 0) > 1) {
+                                takeAlternativeAt(map, point)
+                                true
+                            } else {
+                                false
+                            }
                         }
                     }
                 }

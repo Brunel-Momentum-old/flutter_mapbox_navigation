@@ -306,6 +306,33 @@ class NavStopPin {
       };
 }
 
+/// The driver took another way by tapping it on the map
+/// (`MapBoxEvent.route_switched`).
+class RouteSwitched {
+  const RouteSwitched({required this.secondsSaved});
+
+  /// What the new way saves against the old one; negative when it takes
+  /// longer.
+  final int secondsSaved;
+
+  /// Accepts the event payload as a map (Android) or a JSON string (iOS).
+  static RouteSwitched? tryParse(Object? data) {
+    Object? decoded = data;
+    if (decoded is String) {
+      if (decoded.isEmpty) return null;
+      try {
+        decoded = jsonDecode(decoded);
+      } on FormatException {
+        return null;
+      }
+    }
+    if (decoded is String) return tryParse(decoded);
+    if (decoded is! Map) return null;
+    final seconds = decoded['secondsSaved'];
+    return seconds is num ? RouteSwitched(secondsSaved: seconds.round()) : null;
+  }
+}
+
 /// What the map camera is doing.
 enum NavCameraState {
   /// Tracking the driver.

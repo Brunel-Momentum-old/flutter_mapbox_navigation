@@ -142,6 +142,27 @@ void main() {
       }
     });
 
+    test('route_switched carries what the new way saves, from a map or a '
+        'JSON string', () {
+      for (final data in [
+        {'secondsSaved': 180},
+        '{"secondsSaved":180}',
+        jsonEncode('{"secondsSaved":180}'),
+      ]) {
+        final event = RouteEvent.fromJson(
+          {'eventType': 'route_switched', 'data': data},
+        );
+        expect(event.eventType, MapBoxEvent.route_switched);
+        expect((event.data as RouteSwitched).secondsSaved, 180);
+      }
+      final longer = RouteEvent.fromJson(
+        const {'eventType': 'route_switched', 'data': '{"secondsSaved":-120}'},
+      );
+      expect((longer.data as RouteSwitched).secondsSaved, -120);
+      expect(RouteSwitched.tryParse('nope'), isNull);
+      expect(RouteSwitched.tryParse(const {'other': 1}), isNull);
+    });
+
     test('an unknown camera state is null', () {
       final event = RouteEvent.fromJson(
         const {'eventType': 'camera_state', 'data': 'spinning'},

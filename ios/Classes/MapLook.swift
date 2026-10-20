@@ -111,12 +111,16 @@ extension NavigationFactory {
                 // which keeps the marker where it is.
                 viewport.options.followingCameraOptions.pitchNearManeuver.enabled = false
             }
-            // The host offers a faster route in its own card; the SDK's
-            // "2 min slower" bubbles on every alternative are noise.
+            // Each other way carries the host's own tag of what it costs
+            // or saves (`labelAlternatives`), in the look of the street
+            // tag at a turn; the SDK's bubbles would say it twice.
             map.showsRelativeDurationOnContinuousAlternativeRoutes = false
-            // And nothing switches route without that card: left alone,
-            // a tap anywhere near an alternative's line took it.
-            map.tapGestureDistanceThreshold = 0
+            // A driver may take another way by tapping it (founder,
+            // 2026-10-19): its line, or its tag. The SDK's 50 pt reach
+            // took a tap anywhere near a line, so a pan or a tap on the
+            // map swapped the route by accident; a line must be within
+            // a fingertip.
+            map.tapGestureDistanceThreshold = 24
             HostMapColor.style(map, night: _nightMode)
             // The SDK's own marker view, in a kind that animates at the
             // map's rate (see PacedPuckView).
@@ -140,9 +144,11 @@ extension NavigationFactory {
         // The new style drops the layers drawn here. Forgetting what is
         // on the map makes the next tick draw it again.
         _fasterRouteOnMap = nil
+        _alternativeTipsKey = nil
         _shownTags = ""
         _shownDestinationPin = nil
         _trafficLightsDrawnAt = nil
+        _trafficLightLayerSetAt = nil
         _routeLineColouredForNight = nil
         _houseNumbersKey = nil
         colourRouteLine()
@@ -209,6 +215,7 @@ extension NavigationFactory {
     /// without saying so, so ours is set again every quarter of a minute
     /// as well as after a change of day and night.
     func drawTrafficLights() {
+        showEveryTrafficLight()
         if let at = _trafficLightsDrawnAt, Date().timeIntervalSince(at) < 15 { return }
         guard let style = _navigationViewController?.navigationMapView?.mapView.mapboxMap.style else { return }
         // The SDK's name for it; the layer it draws the lights with
@@ -220,6 +227,38 @@ extension NavigationFactory {
             guard (try? style.addImage(image, id: "traffic_signal")) != nil else { return }
         }
         _trafficLightsDrawnAt = Date()
+    }
+
+    /// Both lights of a crossing at the normal driving view (founder,
+    /// 2026-10-19: zoomed in he saw both lights and it looked great; at
+    /// the normal view only one, and he could not tell where to turn).
+    ///
+    /// The lights are the SDK's own layer, and it hides a light that
+    /// would touch another (`icon-allow-overlap` false). At driving zoom
+    /// the two lights of one crossing, some 20 m apart, always touch, so
+    /// one of them went. Here they may overlap, they take no room from the
+    /// street names (`icon-ignore-placement`), and they are drawn smaller
+    /// the further out the camera is, so the two sit side by side rather
+    /// than on top of each other.
+    ///
+    /// The SDK makes the layer when the trip starts, under a name we can
+    /// only match the end of. Tried every tick until it exists, then again
+    /// every quarter of a minute with the picture: a restyle can rebuild
+    /// it with the SDK's settings.
+    func showEveryTrafficLight() {
+        if let at = _trafficLightLayerSetAt, Date().timeIntervalSince(at) < 15 { return }
+        guard let style = _navigationViewController?.navigationMapView?.mapView.mapboxMap.style,
+              let layer = style.allLayerIdentifiers.first(where: {
+                  $0.id.hasSuffix("_intersectionAnnotationsLayer")
+              })?.id
+        else { return }
+        try? style.setLayerProperty(for: layer, property: "icon-allow-overlap", value: true)
+        try? style.setLayerProperty(for: layer, property: "icon-ignore-placement", value: true)
+        try? style.setLayerProperty(
+            for: layer, property: "icon-size",
+            value: ["interpolate", ["linear"], ["zoom"], 14, 0.45, 16, 0.62, 17.5, 0.85, 19, 1.0]
+        )
+        _trafficLightLayerSetAt = Date()
     }
 
     static func trafficLightImage() -> UIImage {
@@ -619,14 +658,19 @@ extension NavigationFactory {
         // Traffic is a thing of the road, not of the door; and a faster
         // route on offer says the same with a way out attached.
         let traffic = (_doorView == nil && _fasterTips.isEmpty) ? _trafficTag : nil
+        // The other ways' tags are for the road, not the door.
+        let alternatives = _doorView == nil ? _alternativeTips : []
         let key = [turn.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? "",
                    traffic.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" } ?? ""]
             + _fasterTips.map { "\($0.0.latitude),\($0.0.longitude),\($0.1)" }
+            + alternatives.map { "\($0.0.latitude),\($0.0.longitude),\($0.1),\($0.2)" }
         let joined = key.joined(separator: ";") + (_nightMode ? "n" : "d")
         guard joined != _shownTags else { return }
         _shownTags = joined
         if _tagManager == nil {
             _tagManager = mapView.annotations.makePointAnnotationManager(id: "host-tags")
+            // A tag of another way takes that way (`annotationManager`).
+            _tagManager?.delegate = self
         }
         var tags: [PointAnnotation] = []
         if let turn = turn {
@@ -648,9 +692,79 @@ extension NavigationFactory {
             tag.image = .init(image: Self.tagImage(text, fill: yours ? HostMapColor.tip : HostMapColor.tipGreen, pointer: false),
                               name: "host-tip-\(text)")
             tag.symbolSortKey = yours ? 0 : 1
+            if !yours, let id = _fasterRouteOnMap { tag.userInfo = ["alternative": id] }
+            tags.append(tag)
+        }
+        for (at, text, id) in alternatives {
+            var tag = PointAnnotation(coordinate: at)
+            tag.image = .init(image: Self.tagImage(text, fill: HostMapColor.tip, pointer: false),
+                              name: "host-alt-\(text)")
+            tag.symbolSortKey = 2
+            tag.userInfo = ["alternative": id]
             tags.append(tag)
         }
         _tagManager?.annotations = tags
+    }
+
+    // MARK: Other ways
+
+    /// Tags every other way the SDK has found with what it costs or
+    /// saves against the route in use: "+3 min", "2 min faster", "Same
+    /// time" — in the look of the street tag at a turn, just past where it
+    /// leaves the route (founder, 2026-10-19): like the street tag, it is
+    /// on screen as the driver comes up to the choice, not kilometres out
+    /// of view along the other way. The faster way on offer already has
+    /// its green tag and is left out here. A tap on a tag, or a fingertip
+    /// on the line, takes that way.
+    func labelAlternatives(show: Bool) {
+        var tips: [(CLLocationCoordinate2D, String, AlternativeRoute.ID)] = []
+        if show, let router = _navigationViewController?.navigationService.router {
+            for alternative in router.continuousAlternatives where alternative.id != _fasterRouteOnMap {
+                guard let whole = alternative.indexedRouteResponse.currentRoute?.shape,
+                      let end = whole.coordinates.last,
+                      let branch = whole.sliced(from: alternative.alternativeRouteIntersection.location, to: end),
+                      let length = branch.distance(),
+                      let at = branch.coordinateFromStart(distance: min(Self.alternativeTagPastForkM, length * 0.4))
+                else { continue }
+                tips.append((at, Self.alternativeLabel(alternative.expectedTravelTimeDelta), alternative.id))
+            }
+        }
+        let key = tips.map { "\($0.2):\($0.1)" }.joined(separator: ";")
+        guard key != _alternativeTipsKey else { return }
+        _alternativeTipsKey = key
+        _alternativeTips = tips
+        refreshTags()
+    }
+
+    /// How far along another way its tag sits, past the fork.
+    static let alternativeTagPastForkM: CLLocationDistance = 200
+
+    /// What another way costs or saves, to the minute.
+    static func alternativeLabel(_ delta: TimeInterval) -> String {
+        let minutes = Int((abs(delta) / 60).rounded())
+        if minutes < 1 { return "Same time" }
+        return delta < 0 ? "\(minutes) min faster" : "+\(minutes) min"
+    }
+
+    /// Makes another way the route in use, in place — no new trip, the
+    /// door view and the voice carry on — and tells the host.
+    func takeAlternative(_ id: AlternativeRoute.ID) {
+        guard let router = _navigationViewController?.navigationService.router,
+              let alternative = router.continuousAlternatives.first(where: { $0.id == id })
+        else { return }
+        router.updateRoute(with: alternative.indexedRouteResponse, routeOptions: nil) { [weak self] success in
+            guard success else { return }
+            self?.announceRouteSwitch(alternative)
+        }
+    }
+
+    /// `route_switched`, with the seconds the new way saves (negative: it
+    /// takes longer).
+    func announceRouteSwitch(_ alternative: AlternativeRoute) {
+        let saved = Int((-alternative.expectedTravelTimeDelta).rounded())
+        sendEvent(eventType: MapBoxEventType.route_switched, data: "{\"secondsSaved\":\(saved)}")
+        _alternativeTipsKey = nil
+        emitNavState()
     }
 
     /// A dark or green rounded tag with white text; `pointer` adds a tail
@@ -1180,6 +1294,19 @@ extension NavigationFactory {
         if let lit = ids.firstIndex(where: { $0.hasSuffix("_buildingExtrusionLayer") }),
            let numbers = ids.firstIndex(of: layerId), numbers < lit {
             try? style.moveLayer(withId: layerId, to: .above(ids[lit]))
+        }
+    }
+}
+
+extension NavigationFactory: AnnotationInteractionDelegate {
+    /// A tap on a tag of another way takes that way.
+    public func annotationManager(_ manager: AnnotationManager, didDetectTappedAnnotations annotations: [Annotation]) {
+        guard manager.id == "host-tags" else { return }
+        for annotation in annotations {
+            if let id = (annotation as? PointAnnotation)?.userInfo?["alternative"] as? AlternativeRoute.ID {
+                takeAlternative(id)
+                return
+            }
         }
     }
 }

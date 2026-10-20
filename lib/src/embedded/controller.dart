@@ -230,6 +230,17 @@ class MapBoxNavigationViewController {
   Future<void> declineFasterRoute() =>
       _methodChannel.invokeMethod<void>('declineFasterRoute');
 
+  /// Walking directions to the stop from where the driver is, or driving
+  /// ones again ([walking] false), swapped into the trip already running:
+  /// the door view and the voice carry on. False when no route came back
+  /// (the old one stays).
+  Future<bool> setTravelMode({required bool walking}) async =>
+      await _methodChannel.invokeMethod<bool>(
+        'setTravelMode',
+        {'walking': walking},
+      ) ??
+      false;
+
   /// Generic Handler for Messages sent from the Platform
   Future<dynamic> _handleMethod(MethodCall call) async {
     switch (call.method) {

@@ -244,6 +244,7 @@ extension NavigationFactory {
         // "finding the route" state for the second or two it takes.
         guard isEmbeddedNavigation, _eventSink != nil, !_navigatorBehind, let progress = _lastProgress else { return }
         showFasterRouteOnMap(!_offRoute && !_rerouting ? fasterAlternative() : nil)
+        labelAlternatives(show: !_offRoute && !_rerouting)
         tagNextTurn(progress)
         markDestination(progress)
         frameTurn(progress)

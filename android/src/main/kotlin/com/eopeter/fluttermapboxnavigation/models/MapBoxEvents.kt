@@ -21,5 +21,6 @@ enum class MapBoxEvents(val value: String) {
     REROUTE_ALONG("reroute_along"),
     ON_MAP_TAP("on_map_tap"),
     NAV_STATE("nav_state"),
-    CAMERA_STATE("camera_state")
+    CAMERA_STATE("camera_state"),
+    ROUTE_SWITCHED("route_switched")
 }

@@ -57,6 +57,9 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
 import kotlin.math.roundToInt
+import kotlin.math.hypot
+import kotlin.math.abs
+import com.mapbox.maps.MapView
 
 /** How much faster an alternative has to be before it is offered. */
 private const val DEFAULT_FASTER_ROUTE_MIN_SAVING_S = 120.0
@@ -86,6 +89,9 @@ private const val TRAFFIC_RECHECK_MS = 30_000L
  * red on the route line agree.
  */
 private const val HEAVY_CONGESTION_FROM = 60
+
+/** How far along another way its tag sits, in metres past the fork. */
+private const val ALTERNATIVE_TAG_PAST_FORK_M = 200.0
 
 open class TurnByTurn(
     ctx: Context,
@@ -304,6 +310,9 @@ open class TurnByTurn(
                 this.fasterAlternative()?.let { this.declinedAlternativeIds.add(it.id) }
                 this.emitNavState()
                 result.success(true)
+            }
+            "setTravelMode" -> {
+                this.setTravelMode(methodCall.argument<Boolean>("walking") ?: false, result)
             }
             else -> result.notImplemented()
         }
@@ -768,6 +777,11 @@ open class TurnByTurn(
     /// The host may change it (`setFasterRouteMinimumSaving`).
     private var fasterRouteMinSavingS = DEFAULT_FASTER_ROUTE_MIN_SAVING_S
     private var fasterRouteOnMap: String? = null
+
+    /// Where each other way's tag sits, by route id, for a tap
+    /// (`takeAlternativeAt`); the faster way on offer's green tag too.
+    private var alternativeTipTargets: List<Pair<Point, String>> = emptyList()
+    private var fasterTipTarget: Pair<Point, String>? = null
     private var nightMode = false
 
     /** Route line, puck, stop pins and the door view. */
@@ -917,6 +931,7 @@ open class TurnByTurn(
         val metadata = faster?.let { navigation?.getAlternativeMetadataFor(it) }
         val geometry = faster?.directionsRoute?.geometry()
         if (faster == null || metadata == null || geometry == null) {
+            this.fasterTipTarget = null
             this.mapLook.setFasterRoute(null, 0, null)
             return
         }
@@ -933,7 +948,124 @@ open class TurnByTurn(
                 rest, TurfMeasurement.length(rest, TurfConstants.UNIT_METERS) * 0.4, TurfConstants.UNIT_METERS)
         }
         val minutes = ((this.fasterRouteSaving ?: 0.0) / 60.0).roundToInt().coerceAtLeast(1)
+        val length = TurfMeasurement.length(branch, TurfConstants.UNIT_METERS)
+        this.fasterTipTarget = if (length > 0) {
+            TurfMeasurement.along(branch, length * 0.4, TurfConstants.UNIT_METERS) to faster.id
+        } else {
+            null
+        }
         this.mapLook.setFasterRoute(branch, minutes, yours)
+    }
+
+    /**
+     * Tags every other way with what it costs or saves against the route
+     * in use, just past where it leaves it (`MapLook.setAlternativeTags`):
+     * like the street tag at a turn, on screen as the driver comes up to
+     * the choice. The faster way on offer has its own green tag and is
+     * left out.
+     */
+    private fun labelAlternatives(show: Boolean) {
+        val navigation = MapboxNavigationApp.current()
+        val routes = this.activeRoutes
+        val tips = mutableListOf<Pair<Point, String>>()
+        val targets = mutableListOf<Pair<Point, String>>()
+        if (show && navigation != null && routes.size > 1) {
+            val primaryDuration = routes.first().directionsRoute.duration()
+            for (route in routes.drop(1)) {
+                if (route.id == this.fasterRouteOnMap) continue
+                val metadata = navigation.getAlternativeMetadataFor(route) ?: continue
+                val geometry = route.directionsRoute.geometry() ?: continue
+                val whole = LineString.fromPolyline(geometry, 6)
+                val branch = TurfMisc.lineSlice(
+                    metadata.forkIntersectionOfAlternativeRoute.location, whole.coordinates().last(), whole)
+                val length = TurfMeasurement.length(branch, TurfConstants.UNIT_METERS)
+                if (length <= 0) continue
+                val at = TurfMeasurement.along(
+                    branch, minOf(ALTERNATIVE_TAG_PAST_FORK_M, length * 0.4), TurfConstants.UNIT_METERS)
+                val delta = metadata.infoFromStartOfPrimary.duration - primaryDuration
+                tips.add(at to alternativeLabel(delta))
+                targets.add(at to route.id)
+            }
+        }
+        this.alternativeTipTargets = targets
+        this.mapLook.setAlternativeTags(tips)
+    }
+
+    /** What another way costs or saves, to the minute. */
+    private fun alternativeLabel(deltaSeconds: Double): String {
+        val minutes = (abs(deltaSeconds) / 60.0).roundToInt()
+        if (minutes < 1) return "Same time"
+        return if (deltaSeconds < 0) "$minutes min faster" else "+$minutes min"
+    }
+
+    /**
+     * A tap on the map while there is more than one way: the tag of
+     * another way takes it, else the line of one within a fingertip (the
+     * part that leaves the route in use). Anything else does nothing.
+     */
+    fun takeAlternativeAt(map: MapView, point: Point) {
+        try {
+            val mapboxMap = map.getMapboxMap()
+            val density = map.resources.displayMetrics.density
+            val tap = mapboxMap.pixelForCoordinate(point)
+            // A tag is about a thumb wide and a finger tall.
+            val tags = this.alternativeTipTargets + listOfNotNull(this.fasterTipTarget)
+            for ((at, id) in tags) {
+                val p = mapboxMap.pixelForCoordinate(at)
+                if (abs(p.x - tap.x) < 60 * density && abs(p.y - tap.y) < 24 * density) {
+                    this.takeAlternative(id)
+                    return
+                }
+            }
+            val navigation = MapboxNavigationApp.current() ?: return
+            val reach = 24 * density
+            var best: String? = null
+            var bestDistance = reach.toDouble()
+            for (route in this.activeRoutes.drop(1)) {
+                val metadata = navigation.getAlternativeMetadataFor(route) ?: continue
+                val geometry = route.directionsRoute.geometry() ?: continue
+                val whole = LineString.fromPolyline(geometry, 6)
+                val branch = TurfMisc.lineSlice(
+                    metadata.forkIntersectionOfAlternativeRoute.location, whole.coordinates().last(), whole)
+                val pixels = branch.coordinates().map { mapboxMap.pixelForCoordinate(it) }
+                for (i in 0 until pixels.size - 1) {
+                    val d = segmentDistance(tap.x, tap.y, pixels[i].x, pixels[i].y, pixels[i + 1].x, pixels[i + 1].y)
+                    if (d < bestDistance) {
+                        bestDistance = d
+                        best = route.id
+                    }
+                }
+            }
+            best?.let { this.takeAlternative(it) }
+        } catch (e: java.lang.Exception) {
+            Log.w("TurnByTurn", "a tap on another way was not read: $e")
+        }
+    }
+
+    private fun segmentDistance(px: Double, py: Double, ax: Double, ay: Double, bx: Double, by: Double): Double {
+        val dx = bx - ax
+        val dy = by - ay
+        val lengthSquared = dx * dx + dy * dy
+        val t = if (lengthSquared == 0.0) 0.0 else (((px - ax) * dx + (py - ay) * dy) / lengthSquared).coerceIn(0.0, 1.0)
+        return hypot(px - (ax + t * dx), py - (ay + t * dy))
+    }
+
+    /**
+     * Makes another way the route in use, in place — the trip, the door
+     * view and the voice carry on — and tells the host (`route_switched`,
+     * with the seconds it saves; negative when it takes longer).
+     */
+    private fun takeAlternative(routeId: String): Boolean {
+        val navigation = MapboxNavigationApp.current() ?: return false
+        val routes = this.activeRoutes
+        val alternative = routes.drop(1).firstOrNull { it.id == routeId } ?: return false
+        val metadata = navigation.getAlternativeMetadataFor(alternative)
+        val saved = metadata?.let {
+            (routes.first().directionsRoute.duration() - it.infoFromStartOfPrimary.duration).roundToInt()
+        } ?: 0
+        navigation.setNavigationRoutes(listOf(alternative) + routes.filter { it.id != routeId })
+        this.sendEvent(MapBoxEvents.ROUTE_SWITCHED, "{\"secondsSaved\":$saved}")
+        return true
     }
 
     /**
@@ -1192,6 +1324,61 @@ open class TurnByTurn(
         return best
     }
 
+    /**
+     * On foot for the last stretch (founder, 2026-10-19): walking
+     * directions to the stop from where the driver is, or driving ones
+     * again, put in place of the route in use. The trip carries on, so
+     * the door view — camera, house numbers, the lit building — and the
+     * voice go on without a flicker. A re-route on foot stays on foot:
+     * the navigator re-routes with the route's own options. Walking takes
+     * no toll exclusion (the Directions API refuses one for it).
+     */
+    private fun setTravelMode(walking: Boolean, result: MethodChannel.Result) {
+        val navigation = MapboxNavigationApp.current()
+        val here = this.lastLocation?.let { Point.fromLngLat(it.longitude, it.latitude) }
+        val destination = this.activeRoutes.firstOrNull()?.routeOptions?.coordinatesList()?.lastOrNull()
+        if (navigation == null || here == null || destination == null) {
+            result.success(false)
+            return
+        }
+        val options = RouteOptions.builder()
+            .applyDefaultNavigationOptions(
+                if (walking) DirectionsCriteria.PROFILE_WALKING else DirectionsCriteria.PROFILE_DRIVING_TRAFFIC
+            )
+            .applyLanguageAndVoiceUnitOptions(this.context)
+            .coordinatesList(listOf(here, destination))
+            .language(navigationLanguage)
+            .alternatives(!walking && alternatives)
+            .steps(true)
+            .voiceUnits(navigationVoiceUnits)
+            .bannerInstructions(bannerInstructionsEnabled)
+            .voiceInstructions(voiceInstructionsEnabled)
+        if (!walking) options.exclude(DirectionsCriteria.EXCLUDE_TOLL)
+        navigation.requestRoutes(
+            options.build(),
+            object : NavigationRouterCallback {
+                override fun onRoutesReady(routes: List<NavigationRoute>, routerOrigin: RouterOrigin) {
+                    if (routes.isEmpty()) {
+                        result.success(false)
+                        return
+                    }
+                    // Ours, so the trip's safety nets treat it as this view's.
+                    this@TurnByTurn.ownRouteIds.addAll(routes.map { it.id })
+                    navigation.setNavigationRoutes(routes)
+                    result.success(true)
+                }
+
+                override fun onFailure(reasons: List<RouterFailure>, routeOptions: RouteOptions) {
+                    result.success(false)
+                }
+
+                override fun onCanceled(routeOptions: RouteOptions, routerOrigin: RouterOrigin) {
+                    result.success(false)
+                }
+            },
+        )
+    }
+
     private fun acceptFasterRoute(): Boolean {
         val navigation = MapboxNavigationApp.current() ?: return false
         val alternative = this.fasterAlternative() ?: return false
@@ -1298,6 +1485,11 @@ open class TurnByTurn(
             this.showFasterRouteOnMap(faster)
         } catch (e: java.lang.Exception) {
             this.logDrawingFailureOnce("the faster route", e)
+        }
+        try {
+            this.labelAlternatives(!this.offRoute && !this.rerouting)
+        } catch (e: java.lang.Exception) {
+            this.logDrawingFailureOnce("the other ways' tags", e)
         }
         try {
             this.tagNextTurn(progress)

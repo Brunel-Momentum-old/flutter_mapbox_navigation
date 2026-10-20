@@ -32,6 +32,8 @@ class RouteEvent {
       data = NavState.tryParse(dataJson);
     } else if (eventType == MapBoxEvent.camera_state) {
       data = NavCameraState.tryParse(dataJson);
+    } else if (eventType == MapBoxEvent.route_switched) {
+      data = RouteSwitched.tryParse(dataJson);
     } else if (eventType == MapBoxEvent.on_map_tap) {
       final json =
           Platform.isAndroid ? dataJson : jsonDecode(dataJson as String);

@@ -27,4 +27,8 @@ enum MapBoxEvent {
 
   /// The map camera changed mode. Data is a [NavCameraState].
   camera_state,
+
+  /// The driver took another way by tapping it on the map. Data is a JSON
+  /// object `{"secondsSaved": int}` (negative: the new way takes longer).
+  route_switched,
 }

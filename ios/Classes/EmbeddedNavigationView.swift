@@ -152,6 +152,10 @@ public class FlutterMapboxNavigationView : NavigationFactory, FlutterPlatformVie
                 strongSelf.declineFasterRoute()
                 result(true)
             }
+            else if(call.method == "setTravelMode")
+            {
+                strongSelf.setTravelMode(walking: arguments?["walking"] as? Bool ?? false, result: result)
+            }
             else
             {
                 result("method is not implemented");

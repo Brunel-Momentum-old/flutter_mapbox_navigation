@@ -121,6 +121,7 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _destinationPinManager: PointAnnotationManager?
     var _shownDestinationPin: String?
     var _trafficLightsDrawnAt: Date?
+    var _trafficLightLayerSetAt: Date?
     var _trafficTag: (CLLocationCoordinate2D, String)?
     var _trafficCheckedAt: Date?
     var _trafficCheckedFor: String?
@@ -128,6 +129,10 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
     var _fasterTips: [(CLLocationCoordinate2D, String)] = []
     var _shownTags = ""
     var _fasterRouteOnMap: AlternativeRoute.ID?
+    /// Every other way on the map, each tagged with what it costs or
+    /// saves, and which way it is (`labelAlternatives`).
+    var _alternativeTips: [(CLLocationCoordinate2D, String, AlternativeRoute.ID)] = []
+    var _alternativeTipsKey: String?
 
     /// How much faster an alternative has to be before it is offered.
     /// The host may change it (`setFasterRouteMinimumSaving`).
@@ -435,12 +440,15 @@ public class NavigationFactory : NSObject, FlutterStreamHandler
         _destinationPinManager = nil
         _shownDestinationPin = nil
         _trafficLightsDrawnAt = nil
+        _trafficLightLayerSetAt = nil
         _trafficTag = nil
         _trafficCheckedAt = nil
         _trafficCheckedFor = nil
         _turnTag = nil
         _fasterTips = []
         _fasterRouteOnMap = nil
+        _alternativeTips = []
+        _alternativeTipsKey = nil
         _routeLook = "normal"
         _doorView = nil
         _routeLineColouredForNight = nil
@@ -788,6 +796,12 @@ extension NavigationFactory : NavigationViewControllerDelegate {
         _rerouting = false
         sendEvent(eventType: MapBoxEventType.failed_to_reroute, data: error.localizedDescription)
         emitNavState()
+    }
+
+    /// The driver tapped another way's line on the map: the SDK has made it
+    /// the route in use (`router.updateRoute`); the host is told.
+    public func navigationViewController(_ navigationViewController: NavigationViewController, didSelect continuousAlternative: AlternativeRoute) {
+        announceRouteSwitch(continuousAlternative)
     }
 
     public func navigationViewController(_ navigationViewController: NavigationViewController, didUpdateAlternatives updatedAlternatives: [AlternativeRoute], removedAlternatives: [AlternativeRoute]) {

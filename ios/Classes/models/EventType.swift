@@ -21,4 +21,5 @@ enum MapBoxEventType: String, Codable
     case on_map_tap
     case nav_state
     case camera_state
+    case route_switched
 }
